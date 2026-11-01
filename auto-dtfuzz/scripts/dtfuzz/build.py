@@ -206,7 +206,15 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
         for raw in missing:
             symbol = _find_symbol(analysis, raw)
             if symbol:
-                known.append({"raw": raw, "symbol": symbol.get("name"), "signature": symbol.get("signature", "")})
+                known.append(
+                    {
+                        "raw": raw,
+                        "symbol": symbol.get("name"),
+                        "signature": symbol.get("signature", ""),
+                        "reachable": symbol.get("reachable", True),
+                        "scope": symbol.get("scope", "unknown"),
+                    }
+                )
         log_text = f"$ {shlex.join(link_cmd)}\n{link.stderr}{link.stdout}"
         existing = build_log.read_text(encoding="utf-8", errors="replace") if build_log.exists() else ""
         write_text(build_log, existing + "\n\n" + log_text)
@@ -220,7 +228,9 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
                 "confirmed": bool(symbol.get("confirmed", False)),
             }
             for key, symbol in sorted((mocks.get("symbols") or {}).items())
-            if not symbol.get("confirmed", False) and symbol.get("stub", True)
+            if not symbol.get("confirmed", False)
+            and symbol.get("stub", True)
+            and symbol.get("reachable", True)
         ]
         result = {
             "ok": False,
@@ -335,8 +345,17 @@ def probe(workspace, config: dict, analysis: dict) -> dict:
         raw_names = {symbol.get("mangled_name", ""), symbol.get("name", "")}
         matched = {name for name in raw_names if name and (_normalize_symbol(name) in undefined_norm or _normalize_symbol(name) in defined_norm)}
         matched_norm |= {_normalize_symbol(name) for name in matched}
-        if matched and not any(_normalize_symbol(name) in undefined_norm for name in matched):
-            resolved.append({"symbol": symbol.get("qualified_name") or symbol.get("name"), "signature": symbol.get("signature", "")})
+        # A symbol can be undefined in the object that references it and defined
+        # in another object; the linker resolves the pair.  Presence in
+        # ``defined_norm`` wins over ``undefined_norm``.
+        if matched and any(_normalize_symbol(name) in defined_norm for name in matched):
+            resolved.append(
+                {
+                    "symbol": symbol.get("qualified_name") or symbol.get("name"),
+                    "signature": symbol.get("signature", ""),
+                    "reachable": symbol.get("reachable", True),
+                }
+            )
         else:
             unresolved.append(
                 {
@@ -344,6 +363,8 @@ def probe(workspace, config: dict, analysis: dict) -> dict:
                     "name": symbol.get("name"),
                     "signature": symbol.get("signature", ""),
                     "status": symbol.get("status", "missing"),
+                    "reachable": symbol.get("reachable", True),
+                    "scope": symbol.get("scope", "unknown"),
                     "definition_files": symbol.get("definition_files", []),
                     "excluded_definition_files": symbol.get("excluded_definition_files", []),
                 }

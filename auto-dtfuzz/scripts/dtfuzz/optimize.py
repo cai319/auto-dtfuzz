@@ -8,8 +8,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import externals as externals_mod
 from .generate import _dict_escape, _unescape_c, write_corpus_seeds
-from .mocks import set_symbol
+from .mocks import constraint_summary, constraints_prompt_section, merge_constraints, set_symbol
 from .util import DtfuzzError, format_hex, now_iso, read_json, run, snippet, truncate, write_json, write_text
 
 MAX_PROMPT_CHARS = 60000
@@ -154,6 +155,11 @@ def build_prompt(config: dict, analysis: dict, summary: dict, mocks: dict | None
     lines.append("## 当前 mock 配置")
     lines.append(_mocks_section(mocks))
     lines.append("")
+    lines.append(constraints_prompt_section(mocks))
+    lines.append("")
+    lines.append("## 外部库/平台组件源码（用户提供的外挂目录，只读）")
+    lines.append(externals_mod.source_context(analysis))
+    lines.append("")
     lines.append("## 外部函数可控性")
     lines.append(
         "stub body 可以调用 `dtfuzz_input_byte(i)`（越界返回 0）和 `dtfuzz_input_size()`，"
@@ -172,6 +178,14 @@ def build_prompt(config: dict, analysis: dict, summary: dict, mocks: dict | None
                         "body": "if (out) out->code = dtfuzz_input_byte(2) == 0x99 ? 0x99 : 0; return dtfuzz_input_byte(1) & 1 ? 0 : -1;"
                     }
                 },
+                "constraints": {
+                    "input_construction": [
+                        {"subject": "buf", "requirement": "...", "reason": "...", "evidence": "src/msg_parser.c:42", "applies_to": "entry"}
+                    ],
+                    "variable_constraints": [],
+                    "input_relations": [],
+                    "setup_teardown": [],
+                },
                 "notes": "optional short note",
             },
             ensure_ascii=False,
@@ -186,6 +200,10 @@ def build_prompt(config: dict, analysis: dict, summary: dict, mocks: dict | None
     lines.append("- dict 条目使用 libFuzzer 字典语法，二进制字节用 \\xNN。")
     lines.append("- mocks 补丁只使用当前配置里已有的符号名；body 必须是完整 C/C++ 语句，且参数名与签名一致。")
     lines.append("- 如果未覆盖行由外部函数返回值控制，优先修改对应 mock body，而不是只生成种子。")
+    lines.append(
+        "- constraints 是待人工审核的草案：只写有源码/调用方证据的约束，evidence 填 file:line；"
+        "不要重复已确认的约束，也不要把草案当成已生效规则。"
+    )
     prompt = "\n".join(lines)
     return truncate(prompt, MAX_PROMPT_CHARS)
 
@@ -209,7 +227,7 @@ def _extract_json(text: str) -> dict:
     return data
 
 
-def _validate_seeds(data: dict, config: dict) -> tuple[list[bytes], list[str], str, dict]:
+def _validate_seeds(data: dict, config: dict) -> tuple[list[bytes], list[str], str, dict, dict]:
     optimizer = config.get("optimizer", {}) or {}
     max_seeds = int(optimizer.get("max_seeds_per_round", 32))
     max_bytes = int(optimizer.get("max_seed_bytes", 4096))
@@ -261,7 +279,8 @@ def _validate_seeds(data: dict, config: dict) -> tuple[list[bytes], list[str], s
                 clean["note"] = str(patch["note"])
             if clean:
                 mock_patches[str(key)] = clean
-    return seeds, dict_tokens, str(data.get("notes", "")), mock_patches
+    constraints_payload = data.get("constraints") or {}
+    return seeds, dict_tokens, str(data.get("notes", "")), mock_patches, constraints_payload
 
 
 def _append_dict(workspace, tokens: list[str]) -> int:
@@ -424,13 +443,14 @@ def optimize(workspace, config: dict, analysis: dict, summary: dict, mode: str |
     raw_path = workspace.optimizer_dir / f"round-{round_no}-response.txt"
     write_text(raw_path, raw)
     data = _extract_json(raw)
-    seeds, dict_tokens, notes, mock_patches = _validate_seeds(data, config)
+    seeds, dict_tokens, notes, mock_patches, constraints_payload = _validate_seeds(data, config)
     created = add_seeds(workspace, seeds, [""] * len(seeds), mode, round_no)
     dict_added = _append_dict(workspace, dict_tokens)
     mocks = workspace.load_mocks(config)
     for key, patch in mock_patches.items():
         set_symbol(mocks, key, {**patch, "source": "optimizer"})
-    if mock_patches:
+    constraints_added = merge_constraints(mocks, constraints_payload, source=mode, confirmed=False)
+    if mock_patches or constraints_added:
         workspace.save_mocks(mocks, config)
     base.update(
         {
@@ -441,6 +461,162 @@ def optimize(workspace, config: dict, analysis: dict, summary: dict, mode: str |
             "parsed_seeds": len(seeds),
             "mocks_changed": bool(mock_patches),
             "mock_patches": list(mock_patches),
+            "constraints_added": constraints_added,
+        }
+    )
+    return base
+
+
+def _entry_source(config: dict, analysis: dict, limit: int = 24000) -> str:
+    source = (analysis.get("entry", {}) or {}).get("source") or ""
+    if source:
+        return truncate(source, limit)
+    file_name = (config.get("entry", {}) or {}).get("file") or ""
+    if not file_name:
+        return "(入口源码不可用)"
+    try:
+        return truncate(Path(file_name).read_text(encoding="utf-8", errors="replace"), limit)
+    except OSError:
+        return "(入口源码不可用)"
+
+
+def _reachable_context(workspace, config: dict, limit: int = 30000) -> str:
+    reach = read_json(workspace.reachability_path, default=None) or {}
+    functions = [item for item in reach.get("reachable", []) if item.get("known")]
+    functions.sort(key=lambda item: (-(item.get("complexity") or 0), item.get("name", "")))
+    parts = []
+    used = 0
+    for item in functions[:20]:
+        header = (
+            f"- {item.get('name')}  ({item.get('source_file')}:{item.get('line')}) "
+            f"complexity={item.get('complexity', 0)} linkage={item.get('linkage', '')} "
+            f"in_module={item.get('in_module', False)}"
+        )
+        parts.append(header)
+        used += len(header)
+        file_name = item.get("source_file") or ""
+        line = item.get("line")
+        if not file_name or not line:
+            continue
+        try:
+            text = Path(file_name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        block = snippet(text, int(line), radius=12, limit=3000)
+        if used + len(block) > limit:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n".join(parts) if parts else "(没有可用的 Fuzz Introspector 可达函数信息)"
+
+
+def build_constraints_prompt(config: dict, analysis: dict, mocks: dict | None, workspace) -> str:
+    entry = config.get("entry", {})
+    reach = read_json(workspace.reachability_path, default=None) or {}
+    lines = [
+        "你是 C/C++ 输入约束分析器。请为下面的消息入口起草四类输入约束，供人工审核。",
+        "只输出一个 JSON 对象，不要输出解释性正文，不要使用任何工具，不要读取文件。",
+        "",
+        "## 目标入口",
+        f"签名：{_signature_line(config)}",
+        f"输入布局：{_input_layout(config)}",
+        (
+            "Fuzz Introspector 可达性："
+            f"report={reach.get('report')} matched={reach.get('matched')} "
+            f"reachable={len(reach.get('reachable', []))} external={len(reach.get('external_functions', []))}"
+        ),
+        "",
+        "## 入口源码",
+        _entry_source(config, analysis),
+        "",
+        "## 从入口可达的函数（按复杂度排序，来自 Fuzz Introspector 静态图）",
+        _reachable_context(workspace, config),
+        "",
+        "## 当前 mock",
+        _mocks_section(mocks),
+        "",
+        constraints_prompt_section(mocks or {}),
+        "",
+        "## 外部库/平台组件源码（用户提供的外挂目录，只读）",
+        externals_mod.source_context(analysis),
+        "",
+        "## 四类约束的定义",
+        "1. input_construction：如何构造合法输入/参数。写清使用哪个函数、哪个字段、哪种缓冲区布局；"
+        "例如“调用方先用 build_packet() 生成 1 字节 type + 2 字节大端长度 + payload”。",
+        "2. variable_constraints：单个变量的隐式约束。范围、非空、以 NUL 结尾、枚举取值、指针对齐、"
+        "最大长度等；例如“len 必须大于 0 且不超过 4096”。",
+        "3. input_relations：多个输入之间的关系。例如“buf 非空时 len 必须等于剩余 payload 长度”，"
+        "“type 字段决定 payload 的解析分支”。",
+        "4. setup_teardown：调用入口前必须执行的初始化，以及每次 fuzz 输入后需要清理的状态；"
+        "例如“先调用 msg_init() 注册表”，或“每次输入后调用 msg_reset()”。",
+        "",
+        "## 输出格式",
+        json.dumps(
+            {
+                "constraints": {
+                    "input_construction": [
+                        {
+                            "subject": "buf",
+                            "requirement": "buf 指向至少 len 字节的可读缓冲区",
+                            "reason": "解析器在 len 范围内读取 payload",
+                            "evidence": "src/msg_parser.c:42",
+                            "applies_to": "entry",
+                        }
+                    ],
+                    "variable_constraints": [],
+                    "input_relations": [],
+                    "setup_teardown": [],
+                },
+                "notes": "optional short note",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "",
+        "## 硬性要求",
+        "- 每条必须有 requirement；reason 说明为什么重要；evidence 填能定位的 file:line，定位不到就留空。",
+        "- 只写源码、调用方或可达函数能支持的约束；不要发明函数、结构体字段或缓冲区布局。",
+        "- requirement 必须是可执行的构造/约束描述，不要写成泛泛的功能描述。",
+        "- 每类最多 8 条；没有就返回空列表。",
+        "- 不要重复已确认的约束；草案默认 confirmed=false，等待人工审核。",
+        "- 只输出 JSON，不要输出 Markdown 代码围栏以外的内容。",
+    ]
+    return truncate("\n".join(lines), MAX_PROMPT_CHARS)
+
+
+def draft_constraints(workspace, config: dict, analysis: dict, mocks: dict | None = None, mode: str | None = None) -> dict:
+    optimizer = config.get("optimizer", {}) or {}
+    mode = mode or optimizer.get("mode") or "prompt"
+    mocks = mocks or workspace.load_mocks(config)
+    prompt = build_constraints_prompt(config, analysis, mocks, workspace)
+    workspace.optimizer_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = workspace.optimizer_dir / "constraints-prompt.md"
+    write_text(prompt_path, prompt)
+    base = {"mode": mode, "prompt": str(prompt_path), "constraints_added": []}
+    if mode == "prompt":
+        base["next"] = (
+            f"Read {prompt_path}, generate one JSON object with a constraints section, then run "
+            f"`dtfuzz constraints draft --workdir {workspace.root} --file <result.json>`."
+        )
+        return base
+    if mode == "claude-cli":
+        raw = _call_claude_cli(config, prompt)
+    elif mode in {"anthropic-api", "api"}:
+        raw = _call_anthropic(config, prompt)
+    else:
+        raise DtfuzzError(f"unknown constraints draft mode: {mode}")
+    response_path = workspace.optimizer_dir / "constraints-response.txt"
+    write_text(response_path, raw)
+    data = _extract_json(raw)
+    mocks = workspace.load_mocks(config)
+    added = merge_constraints(mocks, data.get("constraints") or data, source=mode, confirmed=False)
+    if added:
+        workspace.save_mocks(mocks, config)
+    base.update(
+        {
+            "response": str(response_path),
+            "constraints_added": added,
+            "notes": str(data.get("notes", "")),
         }
     )
     return base
@@ -452,14 +628,15 @@ def import_seeds(workspace, config: dict, file_path: str | Path, source: str = "
         raise DtfuzzError(f"seed file not found: {file_path}")
     if isinstance(data, list):
         data = {"seeds": data}
-    seeds, dict_tokens, notes, mock_patches = _validate_seeds(data, config)
+    seeds, dict_tokens, notes, mock_patches, constraints_payload = _validate_seeds(data, config)
     round_no = int((read_json(workspace.coverage_dir / "history.json", default=[]) or [{}])[-1].get("round", 0))
     created = add_seeds(workspace, seeds, [""] * len(seeds), source, round_no)
     dict_added = _append_dict(workspace, dict_tokens)
     mocks = workspace.load_mocks(config)
     for key, patch in mock_patches.items():
         set_symbol(mocks, key, {**patch, "source": source})
-    if mock_patches:
+    constraints_added = merge_constraints(mocks, constraints_payload, source=source, confirmed=False)
+    if mock_patches or constraints_added:
         workspace.save_mocks(mocks, config)
     return {
         "seeds_added": created,
@@ -468,4 +645,5 @@ def import_seeds(workspace, config: dict, file_path: str | Path, source: str = "
         "notes": notes,
         "mocks_changed": bool(mock_patches),
         "mock_patches": list(mock_patches),
+        "constraints_added": constraints_added,
     }

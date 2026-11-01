@@ -9,14 +9,26 @@ import sys
 from pathlib import Path
 
 from . import coverage as coverage_mod
+from . import externals as externals_mod
+from . import introspect as introspect_mod
 from . import optimize as optimize_mod
 from .analyze import analyze_repo
-from .build import auto_stub_and_rebuild, build, probe
+from .build import auto_stub_and_rebuild, build, probe, resolve_sources
 from .campaign import campaign as run_campaign
 from .config import DEFAULT_CONFIG, Workspace, deep_merge, default_workspace_path
 from .detect import doctor, toolchain_for_config
 from .generate import generate_artifacts, write_corpus_seeds
-from .mocks import merge_defaults, questions as mock_questions, set_symbol, summary as mocks_summary
+from .mocks import (
+    constraint_summary,
+    constraints_prompt_section,
+    default_constraints,
+    merge_constraints,
+    merge_defaults,
+    questions as mock_questions,
+    set_constraint_status,
+    set_symbol,
+    summary as mocks_summary,
+)
 from .report import generate_report
 from .runfuzz import run_fuzz
 from .util import DtfuzzError, format_hex, now_iso, parse_hex, print_json, read_json, resolve, write_json
@@ -48,6 +60,31 @@ def _load(args) -> tuple[Workspace, dict, dict]:
 def _safe_module(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
     return cleaned or "module"
+
+
+def _report_path(args, ws: Workspace, config: dict) -> Path | None:
+    if getattr(args, "no_introspector", False):
+        return None
+    explicit = getattr(args, "introspector", None) or (config.get("introspector", {}) or {}).get("report")
+    repo = config.get("repo") or (getattr(args, "repo", None) or os.getcwd())
+    if explicit:
+        return Path(resolve(explicit, repo))
+    return introspect_mod.discover_report(repo, ws.root if ws else None)
+
+
+def _try_load_reachability(
+    path: Path | None,
+    entry_name: str,
+    entry_file: str,
+    repo: str,
+    toolchain: dict,
+) -> tuple[dict | None, str]:
+    if not path:
+        return None, ""
+    try:
+        return introspect_mod.load_report(path, entry_name, entry_file, repo, toolchain), ""
+    except DtfuzzError as exc:
+        return None, f"Fuzz Introspector 报告解析失败，回退到 AST 扫描：{exc}"
 
 
 def _mock_resolved_keys(probe_result: dict, mocks: dict) -> set[str]:
@@ -120,17 +157,66 @@ def cmd_init(args) -> dict:
     include_dirs = list(dict.fromkeys(list(args.include or []) + list(toolchain.get("include_dirs", []))))
     defines = list(dict.fromkeys(list(args.define or []) + list(toolchain.get("defines", []))))
     std = args.std or toolchain.get("std", "")
-    analysis = analyze_repo(
-        repo=repo,
-        entry_name=args.entry,
-        entry_file=args.source,
-        clang=toolchain["clang"],
-        include_dirs=include_dirs,
-        defines=defines,
-        std=std,
-        exclude_dirs=set((existing_config or {}).get("sources", {}).get("exclude_dirs", []) or []),
-        max_files=1 if getattr(args, "no_real_scan", False) else 200,
+    external_temp: dict = {"external_sources": [], "sources": {}}
+    for external_path in getattr(args, "external_source", None) or []:
+        externals_mod.add_source(external_temp, external_path)
+    include_dirs = list(dict.fromkeys([*include_dirs, *external_temp["sources"].get("include_dirs", [])]))
+    defines = list(dict.fromkeys([*defines, *external_temp["sources"].get("defines", [])]))
+    entry_file = str(resolve(args.source, repo)) if args.source else ""
+    preflight_questions = externals_mod.missing_include_questions(
+        repo,
+        [entry_file] if entry_file else [],
+        include_dirs,
+        external_temp["external_sources"],
+        command_hint=(
+            f"dtfuzz init --repo {repo} --entry {args.entry}"
+            + (f" --source {args.source}" if args.source else "")
+            + f" --workdir {workdir} --external-source <DIR> [--include <DIR>] --force"
+        ),
     )
+    report_path = _report_path(args, ws, existing_config or {})
+    reachability, reachability_warning = _try_load_reachability(
+        report_path, args.entry, entry_file, str(repo), toolchain
+    )
+    try:
+        analysis = analyze_repo(
+            repo=repo,
+            entry_name=args.entry,
+            entry_file=args.source,
+            clang=toolchain["clang"],
+            include_dirs=include_dirs,
+            defines=defines,
+            std=std,
+            exclude_dirs=set((existing_config or {}).get("sources", {}).get("exclude_dirs", []) or []),
+            max_files=1 if getattr(args, "no_real_scan", False) else 200,
+            reachability=reachability,
+        )
+    except DtfuzzError as exc:
+        if not preflight_questions:
+            raise
+        data = {
+            "ok": False,
+            "stage": "analyze",
+            "error": str(exc),
+            "external_source_questions": preflight_questions,
+            "next": [
+                "这些头文件看起来来自外部库/平台组件。请提供源码或 include 目录，然后重跑 init（加 --external-source / --include）。",
+                "如果不需要外部源码，也可以把它们补进仓库的 include 路径或用 --define 处理。",
+            ],
+        }
+        _emit(
+            args,
+            data,
+            "analysis failed before a workspace was created; external source inquiry:\n"
+            + externals_mod.format_questions(preflight_questions),
+        )
+        raise SystemExit(1)
+    if reachability_warning:
+        analysis.setdefault("warnings", []).append(reachability_warning)
+    if reachability:
+        introspect_mod.attach(analysis, reachability, repo)
+        analysis.setdefault("warnings", []).extend(reachability.get("warnings", []))
+        introspect_mod.write_reachability(ws, reachability)
     config = deep_merge(DEFAULT_CONFIG, existing_config or {})
     config.update(
         {
@@ -140,6 +226,18 @@ def cmd_init(args) -> dict:
             "build_system": args.build_system or toolchain.get("build_system", "unknown"),
         }
     )
+    if external_temp["external_sources"]:
+        config.setdefault("external_sources", [])
+        known_paths = {item.get("path") for item in config["external_sources"]}
+        for item in external_temp["external_sources"]:
+            if item["path"] not in known_paths:
+                config["external_sources"].append(item)
+        config["sources"]["include_dirs"] = list(
+            dict.fromkeys([*config["sources"].get("include_dirs", []), *external_temp["sources"].get("include_dirs", [])])
+        )
+        config["sources"]["defines"] = list(
+            dict.fromkeys([*config["sources"].get("defines", []), *external_temp["sources"].get("defines", [])])
+        )
     config["entry"] = _entry_from_analysis(analysis)
     repo_resolved = Path(repo).resolve()
 
@@ -153,7 +251,10 @@ def cmd_init(args) -> dict:
         return result
 
     config["sources"]["target"] = rel_items(analysis.get("module_files", analysis.get("internal_files", [])))
-    config["sources"]["real"] = rel_items(analysis.get("real_files", []))
+    existing_real = list((existing_config or {}).get("sources", {}).get("real") or [])
+    config["sources"]["real"] = rel_items(
+        list(dict.fromkeys([*(analysis.get("real_files", []) or []), *existing_real]))
+    )
     config["sources"]["include_dirs"] = include_dirs
     config["sources"]["defines"] = defines
     config["sources"]["std"] = std
@@ -193,6 +294,7 @@ def cmd_init(args) -> dict:
     else:
         analysis["probe"] = {"error": probe_result.get("log", "probe failed")}
         analysis.setdefault("warnings", []).append("链接探测失败；mock 候选基于全仓定义扫描，需在构建时复核。")
+    externals_mod.attach(analysis, config)
     write_json(ws.analysis_path, analysis)
     questions = mock_questions(mocks)
     data = {
@@ -211,10 +313,14 @@ def cmd_init(args) -> dict:
                 "symbol": key,
                 "signature": symbol.get("signature", ""),
                 "status": symbol.get("status", "pending"),
+                "reachable": symbol.get("reachable", True),
             }
             for key, symbol in sorted((mocks.get("symbols") or {}).items())
-            if not symbol.get("confirmed", False)
+            if not symbol.get("confirmed", False) and symbol.get("reachable", True)
         ],
+        "reachability": analysis.get("reachability"),
+        "external_source_summary": analysis.get("external_source_summary", {}),
+        "external_source_questions": analysis.get("external_source_questions", []),
         "mock_questions": questions,
         "analysis_questions": analysis.get("questions", []),
         "warnings": analysis.get("warnings", []),
@@ -238,12 +344,40 @@ def cmd_init(args) -> dict:
         text_lines.append("linked real sources (cross-module):")
         for item in analysis.get("real_files", []):
             text_lines.append(f"  {item}")
+    reachability = analysis.get("reachability") or {}
+    if reachability:
+        text_lines.append(
+            "reachability (Fuzz Introspector): "
+            f"{reachability.get('reachable_count', 0)} reachable, "
+            f"{reachability.get('module_count', 0)} in-module, "
+            f"{reachability.get('external_count', 0)} external"
+        )
+        text_lines.append(f"  report: {reachability.get('report')}")
+        if reachability.get("stub_scope"):
+            text_lines.append("  stub scope (reachable external symbols):")
+            for item in reachability["stub_scope"][:20]:
+                text_lines.append(
+                    f"    {item.get('symbol')} [{item.get('status')}] {item.get('signature', '')}"
+                )
+    external_questions = analysis.get("external_source_questions") or []
+    if external_questions:
+        text_lines.append(
+            "external source inquiry (ask the user for a mounted library/SDK source directory):"
+        )
+        for item in external_questions[:20]:
+            if item.get("kind") == "include":
+                text_lines.append(f"  header {item.get('header')} (used by {item.get('file')})")
+            else:
+                text_lines.append(f"  {item.get('symbol')}: {item.get('signature', '')}")
     text_lines.append(f"mocks config: {mocks_path}")
     text_lines.append("pending mocks (no linked implementation; human rules required):")
     for item in sorted((mocks.get("symbols") or {}).items()):
         key, symbol = item
-        if not symbol.get("confirmed", False):
-            text_lines.append(f"  {key}: {symbol.get('signature', '')} [{symbol.get('status', 'pending')}]")
+        if not symbol.get("confirmed", False) and symbol.get("reachable", True):
+            text_lines.append(
+                f"  {key}: {symbol.get('signature', '')} "
+                f"[{symbol.get('status', 'pending')}; scope={symbol.get('scope', 'unknown')}]"
+            )
     if analysis.get("probe", {}).get("unclassified_symbols"):
         text_lines.append("unclassified undefined symbols (review if project code):")
         for item in analysis["probe"]["unclassified_symbols"][:20]:
@@ -260,8 +394,7 @@ def cmd_init(args) -> dict:
     return data
 
 
-def cmd_analyze(args) -> dict:
-    ws, config, _ = _load(args)
+def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, extra_warnings: list[str] | None = None) -> tuple[dict, dict, dict]:
     toolchain = config.get("toolchain", {})
     entry = config.get("entry", {})
     analysis = analyze_repo(
@@ -273,10 +406,20 @@ def cmd_analyze(args) -> dict:
         defines=list(config.get("sources", {}).get("defines", [])),
         std=config.get("sources", {}).get("std", ""),
         exclude_dirs=set(config.get("sources", {}).get("exclude_dirs", []) or []),
+        reachability=reachability,
     )
+    if extra_warnings:
+        analysis.setdefault("warnings", []).extend(extra_warnings)
+    if reachability:
+        introspect_mod.attach(analysis, reachability, config["repo"])
+        analysis.setdefault("warnings", []).extend(reachability.get("warnings", []))
+        introspect_mod.write_reachability(ws, reachability)
     config["entry"] = _entry_from_analysis(analysis)
     config["sources"]["target"] = analysis.get("module_files", analysis.get("internal_files", []))
-    config["sources"]["real"] = analysis.get("real_files", [])
+    existing_real = list(config.get("sources", {}).get("real") or [])
+    config["sources"]["real"] = list(
+        dict.fromkeys([*(analysis.get("real_files", []) or []), *existing_real])
+    )
     config["coverage"]["target_files"] = analysis.get("target_files", [])
     ws.save_config(config)
     mocks = merge_defaults(analysis, ws.load_mocks(config))
@@ -303,23 +446,318 @@ def cmd_analyze(args) -> dict:
         }
     else:
         analysis["probe"] = {"error": probe_result.get("log", "probe failed")}
+    externals_mod.attach(analysis, config)
     write_json(ws.analysis_path, analysis)
+    return analysis, mocks, probe_result
+
+
+def cmd_analyze(args) -> dict:
+    ws, config, _ = _load(args)
+    report = _report_path(args, ws, config)
+    reachability, warning = _try_load_reachability(
+        report,
+        config.get("entry", {}).get("name", ""),
+        config.get("entry", {}).get("file", ""),
+        config.get("repo", ""),
+        config.get("toolchain", {}),
+    )
+    analysis, mocks, _ = _reanalyze(ws, config, reachability, [warning] if warning else None)
     data = {
         "ok": True,
         "entry": config["entry"],
         "external_symbols": analysis.get("external_symbols"),
         "real_files": analysis.get("real_files"),
         "probe": analysis.get("probe"),
+        "reachability": analysis.get("reachability"),
         "mocks_path": str(ws.mocks_config_path(config)),
         "pending_mocks": [
-            {"symbol": key, "signature": symbol.get("signature", "")}
+            {"symbol": key, "signature": symbol.get("signature", ""), "reachable": symbol.get("reachable", True)}
             for key, symbol in sorted((mocks.get("symbols") or {}).items())
-            if not symbol.get("confirmed", False)
+            if not symbol.get("confirmed", False) and symbol.get("reachable", True)
         ],
         "warnings": analysis.get("warnings", []),
         "mock_questions": mock_questions(mocks),
     }
     _emit(args, data, "\n".join(f"{item['signature']}" for item in analysis.get("external_symbols", [])))
+    return data
+
+
+def cmd_introspect(args) -> dict:
+    ws, config, analysis = _load(args)
+    repo = config["repo"]
+    entry = config.get("entry", {})
+    report_path: Path | None = None
+    run_info: dict = {}
+    if args.run_light:
+        fi_src = args.fi_src or (config.get("introspector", {}) or {}).get("fi_src") or os.environ.get("FI_SRC")
+        if not fi_src:
+            raise DtfuzzError("--run-light requires --fi-src or config.introspector.fi_src (or FI_SRC)")
+        python = (config.get("introspector", {}) or {}).get("python") or "python3"
+        report_path = introspect_mod.run_light(repo, ws.introspector_dir / "light", fi_src, python)
+        run_info["run"] = "light"
+    elif args.run_lto:
+        fi_clang = args.fi_clang or (config.get("introspector", {}) or {}).get("fi_clang") or os.environ.get("FI_CLANG")
+        if not fi_clang:
+            raise DtfuzzError("--run-lto requires --fi-clang or config.introspector.fi_clang (or FI_CLANG)")
+        harness = next(
+            (item for item in (ws.harness_dir / "fuzz_target.cc", ws.harness_dir / "fuzz_target.c") if item.is_file()),
+            None,
+        )
+        if harness is None:
+            raise DtfuzzError("harness missing; run `dtfuzz gen` before `dtfuzz introspect --run-lto`")
+        fi_src = args.fi_src or (config.get("introspector", {}) or {}).get("fi_src") or os.environ.get("FI_SRC")
+        python = (config.get("introspector", {}) or {}).get("python") or "python3"
+        report_path = introspect_mod.run_lto(
+            repo,
+            ws.introspector_dir / "lto",
+            fi_clang,
+            resolve_sources(config, analysis),
+            str(harness),
+            python=python,
+            fi_src=fi_src,
+        )
+        run_info["run"] = "lto"
+    else:
+        explicit = args.report or (config.get("introspector", {}) or {}).get("report")
+        report_path = Path(resolve(explicit, repo)) if explicit else introspect_mod.discover_report(repo, ws.root)
+    if not report_path or not Path(report_path).exists():
+        raise DtfuzzError(
+            "no Fuzz Introspector report found; pass --report, or use --run-light / --run-lto"
+        )
+    reachability, warning = _try_load_reachability(
+        report_path,
+        entry.get("name", ""),
+        entry.get("file", ""),
+        repo,
+        config.get("toolchain", {}),
+    )
+    if not reachability or not reachability.get("matched"):
+        raise DtfuzzError(warning or f"entry {entry.get('name')!r} was not found in {report_path}")
+    analysis, mocks, _ = _reanalyze(ws, config, reachability, [warning] if warning else None)
+    data = {
+        "ok": True,
+        "report": str(report_path),
+        "run": run_info.get("run", "parse"),
+        "reachability": analysis.get("reachability"),
+        "pending_mocks": [
+            {"symbol": key, "signature": symbol.get("signature", ""), "reachable": symbol.get("reachable", True)}
+            for key, symbol in sorted((mocks.get("symbols") or {}).items())
+            if not symbol.get("confirmed", False) and symbol.get("reachable", True)
+        ],
+        "warnings": analysis.get("warnings", []),
+    }
+    reach = analysis.get("reachability") or {}
+    text_lines = [
+        f"report: {report_path}",
+        f"entry match: {reach.get('entry', {}).get('matched')}",
+        f"reachable: {reach.get('reachable_count', 0)} "
+        f"(module {reach.get('module_count', 0)}, external {reach.get('external_count', 0)})",
+    ]
+    if reach.get("stub_scope"):
+        text_lines.append("stub scope:")
+        for item in reach["stub_scope"][:30]:
+            text_lines.append(f"  {item.get('symbol')} [{item.get('status')}] {item.get('signature', '')}")
+    if reach.get("warnings"):
+        text_lines.extend(f"warning: {item}" for item in reach["warnings"])
+    _emit(args, data, "\n".join(text_lines))
+    return data
+
+
+def cmd_constraints_list(args) -> dict:
+    ws = _workspace(args)
+    config = ws.load_config()
+    mocks = ws.load_mocks(config)
+    rows = constraint_summary(mocks)
+    if args.category:
+        rows = [item for item in rows if item["category"] == args.category]
+    if not args.all:
+        rows = [item for item in rows if item.get("status") != "rejected"]
+    data = {"ok": True, "constraints": rows, "mocks_path": str(ws.mocks_config_path(config))}
+    lines = []
+    for item in rows:
+        marker = "[REVIEW]" if item.get("highlight") else "[OK]"
+        lines.append(
+            f"{marker} {item['id']} [{item['category_label']}] {item['subject']}: "
+            f"{item['requirement']}"
+            + (f"  原因: {item['reason']}" if item.get("reason") else "")
+            + (f"  证据: {item['evidence']}" if item.get("evidence") else "")
+        )
+    _emit(args, data, "\n".join(lines) or "no constraints")
+    return data
+
+
+def cmd_constraints_confirm(args) -> dict:
+    ws = _workspace(args)
+    config = ws.load_config()
+    mocks = ws.load_mocks(config)
+    changed = [item for item in args.id if set_constraint_status(mocks, item, confirmed=True, status="active")]
+    ws.save_mocks(mocks, config)
+    data = {"ok": True, "confirmed": changed, "mocks_path": str(ws.mocks_config_path(config))}
+    _emit(args, data, "confirmed: " + ", ".join(changed) if changed else "no matching constraints")
+    return data
+
+
+def cmd_constraints_reject(args) -> dict:
+    ws = _workspace(args)
+    config = ws.load_config()
+    mocks = ws.load_mocks(config)
+    changed = [item for item in args.id if set_constraint_status(mocks, item, confirmed=False, status="rejected", note=args.note or "rejected by user")]
+    ws.save_mocks(mocks, config)
+    data = {"ok": True, "rejected": changed, "mocks_path": str(ws.mocks_config_path(config))}
+    _emit(args, data, "rejected: " + ", ".join(changed) if changed else "no matching constraints")
+    return data
+
+
+def cmd_constraints_import(args) -> dict:
+    ws = _workspace(args)
+    config = ws.load_config()
+    incoming = read_json(args.file)
+    if incoming is None:
+        raise DtfuzzError(f"file not found: {args.file}")
+    mocks = ws.load_mocks(config)
+    added = merge_constraints(mocks, incoming, source=args.source, confirmed=bool(args.confirm))
+    ws.save_mocks(mocks, config)
+    data = {"ok": True, "constraints_added": added, "mocks_path": str(ws.mocks_config_path(config))}
+    _emit(args, data, f"imported {len(added)} constraint drafts into {ws.mocks_config_path(config)}")
+    return data
+
+
+def cmd_constraints_draft(args) -> dict:
+    ws, config, analysis = _load(args)
+    mocks = ws.load_mocks(config)
+    if args.file:
+        incoming = read_json(args.file)
+        if incoming is None:
+            raise DtfuzzError(f"file not found: {args.file}")
+        added = merge_constraints(mocks, incoming, source="llm", confirmed=False)
+        ws.save_mocks(mocks, config)
+        data = {"ok": True, "constraints_added": added, "mocks_path": str(ws.mocks_config_path(config))}
+        _emit(args, data, f"constraints added: {len(added)}")
+        return data
+    result = optimize_mod.draft_constraints(ws, config, analysis, mocks, mode=args.mode)
+    data = {"ok": True, **result}
+    if result.get("prompt"):
+        text = f"prompt: {result['prompt']}\nnext: {result.get('next', '')}"
+    else:
+        text = f"constraints added: {len(result.get('constraints_added', []))}"
+    _emit(args, data, text)
+    return data
+
+
+def _external_attach(ws: Workspace, config: dict, analysis: dict) -> dict:
+    externals_mod.attach(analysis, config)
+    write_json(ws.analysis_path, analysis)
+    return analysis
+
+
+def cmd_externals_add(args) -> dict:
+    ws, config, analysis = _load(args)
+    entry = externals_mod.add_source(
+        config,
+        args.path,
+        name=args.name or "",
+        link=bool(args.link),
+        include_dirs=list(args.include_dir or []),
+        defines=list(args.define or []),
+        std=args.std or "",
+    )
+    ws.save_config(config)
+    if args.link:
+        reachability = read_json(ws.reachability_path, default=None)
+        analysis, _, _ = _reanalyze(ws, config, reachability)
+    else:
+        _external_attach(ws, config, analysis)
+    data = {
+        "ok": True,
+        "source": entry,
+        "external_source_summary": analysis.get("external_source_summary", {}),
+        "external_source_questions": analysis.get("external_source_questions", []),
+        "warnings": analysis.get("warnings", []),
+    }
+    text_lines = [
+        f"registered external source: {entry['name']} -> {entry['path']} (link={entry['link']})",
+        "matched: " + json.dumps(data["external_source_summary"], ensure_ascii=False),
+    ]
+    if data["external_source_questions"]:
+        text_lines.append("questions:")
+        for item in data["external_source_questions"][:20]:
+            text_lines.append(f"  {item.get('symbol') or item.get('header')}: {item.get('question', '')}")
+    _emit(args, data, "\n".join(text_lines))
+    return data
+
+
+def cmd_externals_list(args) -> dict:
+    ws, config, analysis = _load(args)
+    entries = config.get("external_sources", []) or []
+    data = {
+        "ok": True,
+        "external_sources": entries,
+        "external_source_summary": analysis.get("external_source_summary", {}),
+        "external_source_questions": analysis.get("external_source_questions", []),
+        "matched_functions": [
+            {
+                "symbol": item.get("qualified_name") or item.get("name"),
+                "source": (item.get("external_source") or {}).get("file"),
+                "line": (item.get("external_source") or {}).get("line"),
+            }
+            for item in analysis.get("external_symbols", [])
+            if item.get("external_source")
+        ],
+        "matched_macros": analysis.get("external_macros", []),
+        "matched_types": analysis.get("external_types", []),
+    }
+    lines = [f"- {item['name']}: {item['path']} (link={item.get('link', False)})" for item in entries]
+    if analysis.get("external_source_summary"):
+        lines.append("summary: " + json.dumps(analysis["external_source_summary"], ensure_ascii=False))
+    if data["matched_functions"]:
+        lines.append("matched functions:")
+        for item in data["matched_functions"][:30]:
+            lines.append(f"  {item['symbol']} -> {item['source']}:{item['line']}")
+    if data["external_source_questions"]:
+        lines.append("questions:")
+        for item in data["external_source_questions"][:20]:
+            lines.append(f"  {item.get('symbol') or item.get('header')}: {item.get('question', '')}")
+    _emit(args, data, "\n".join(lines) or "no external sources")
+    return data
+
+
+def cmd_externals_remove(args) -> dict:
+    ws, config, analysis = _load(args)
+    removed = externals_mod.remove_source(config, args.path, unlink=not args.keep_linked)
+    ws.save_config(config)
+    if removed and not args.keep_linked:
+        reachability = read_json(ws.reachability_path, default=None)
+        analysis, _, _ = _reanalyze(ws, config, reachability)
+    else:
+        _external_attach(ws, config, analysis)
+    data = {"ok": removed, "removed": removed, "external_sources": config.get("external_sources", [])}
+    _emit(args, data, f"removed {args.path}" if removed else f"not registered: {args.path}")
+    return data
+
+
+def cmd_externals_scan(args) -> dict:
+    ws, config, analysis = _load(args)
+    _external_attach(ws, config, analysis)
+    data = {
+        "ok": True,
+        "external_source_summary": analysis.get("external_source_summary", {}),
+        "external_source_questions": analysis.get("external_source_questions", []),
+        "matched_functions": [
+            item.get("qualified_name") or item.get("name")
+            for item in analysis.get("external_symbols", [])
+            if item.get("external_source")
+        ],
+    }
+    _emit(args, data, json.dumps(data["external_source_summary"], ensure_ascii=False))
+    return data
+
+
+def cmd_externals_inquire(args) -> dict:
+    ws, config, analysis = _load(args)
+    _external_attach(ws, config, analysis)
+    questions = analysis.get("external_source_questions", [])
+    data = {"ok": True, "questions": questions}
+    _emit(args, data, externals_mod.format_questions(questions) or "no external source questions")
     return data
 
 
@@ -332,6 +770,7 @@ def cmd_probe(args) -> dict:
         "unclassified_symbols": result.get("unclassified_symbols", []),
         "ok": result.get("ok", False),
     }
+    externals_mod.attach(analysis, config)
     write_json(ws.analysis_path, analysis)
     data = {"ok": bool(result.get("ok")), **result}
     if result.get("ok"):
@@ -378,20 +817,40 @@ def cmd_mocks_list(args) -> dict:
     ws = _workspace(args)
     config = ws.load_config()
     mocks = ws.load_mocks(config)
+    analysis = read_json(ws.analysis_path, default={}) or {}
     data = {
         "ok": True,
         "mocks_path": str(ws.mocks_config_path(config)),
         "symbols": mocks_summary(mocks),
+        "constraints": constraint_summary(mocks),
         "questions": mock_questions(mocks),
+        "external_sources": config.get("external_sources", []),
+        "external_source_summary": analysis.get("external_source_summary", {}),
+        "external_source_questions": analysis.get("external_source_questions", []),
         "variables": mocks.get("variables", {}),
     }
     lines = []
     for item in data["symbols"]:
         lines.append(
             f"{item['symbol']}: confirmed={item['confirmed']} status={item['status']} "
+            f"reachable={item.get('reachable', True)} scope={item.get('scope', 'unknown')} "
             f"return={item['return']!r} sequence={item['return_sequence']} out={item['out_params']} "
             f"source={item['source']} stub={item['stub']}"
         )
+    if data["constraints"]:
+        lines.append("constraints:")
+        for item in data["constraints"]:
+            marker = "[REVIEW]" if item.get("highlight") else "[OK]"
+            lines.append(
+                f"  {marker} {item['id']} {item['category_label']} {item['subject']}: {item['requirement']}"
+            )
+    if data["external_source_questions"]:
+        lines.append("external source inquiry (ask the user for a mounted library/SDK directory):")
+        for item in data["external_source_questions"][:20]:
+            if item.get("kind") == "include":
+                lines.append(f"  header {item.get('header')} (used by {item.get('file')})")
+            else:
+                lines.append(f"  {item.get('symbol')}: {item.get('signature', '')}")
     _emit(args, data, "\n".join(lines) or "no mocks")
     return data
 
@@ -441,7 +900,13 @@ def cmd_mocks_set(args) -> dict:
 def cmd_mocks_clear(args) -> dict:
     ws = _workspace(args)
     config = ws.load_config()
-    ws.save_mocks({"version": 1, "symbols": {}, "variables": {}}, config)
+    existing = ws.load_mocks(config)
+    # Constraints describe the entry's input contract, not mock code; keep them
+    # unless the user explicitly clears the whole file.
+    ws.save_mocks(
+        {"version": 1, "symbols": {}, "variables": {}, "constraints": existing.get("constraints") or default_constraints()},
+        config,
+    )
     data = {"ok": True, "mocks_path": str(ws.mocks_config_path(config))}
     _emit(args, data, f"cleared {ws.mocks_config_path(config)}")
     return data
@@ -458,7 +923,11 @@ def cmd_mocks_import(args) -> dict:
     if "symbols" in incoming:
         items = incoming["symbols"].items()
     else:
-        items = ((key, value) for key, value in incoming.items() if key not in {"variables", "version"})
+        items = (
+            (key, value)
+            for key, value in incoming.items()
+            if key not in {"variables", "version", "constraints"}
+        )
     for key, value in items:
         existing = mocks.get("symbols", {}).get(key, {})
         merged = deep_merge(existing, {k: v for k, v in value.items() if k != "out_params"})
@@ -471,8 +940,19 @@ def cmd_mocks_import(args) -> dict:
         imported.append(key)
     if "variables" in incoming:
         mocks.setdefault("variables", {}).update(incoming["variables"])
+    constraints_added = []
+    if "constraints" in incoming:
+        constraints_added = merge_constraints(
+            mocks, incoming["constraints"], source="user", confirmed=bool(getattr(args, "confirm_constraints", False))
+        )
     ws.save_mocks(mocks, config)
-    data = {"ok": True, "symbols": len(mocks.get("symbols", {})), "imported": imported, "mocks_path": str(ws.mocks_config_path(config))}
+    data = {
+        "ok": True,
+        "symbols": len(mocks.get("symbols", {})),
+        "imported": imported,
+        "constraints_added": constraints_added,
+        "mocks_path": str(ws.mocks_config_path(config)),
+    }
     _emit(args, data, f"imported {len(imported)} symbols into {ws.mocks_config_path(config)}")
     return data
 
@@ -720,13 +1200,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir")
     p.add_argument("--force", action="store_true")
     p.add_argument("--no-real-scan", action="store_true", help="analyze only the entry; use for prebuilt libraries")
+    p.add_argument("--introspector", help="Fuzz Introspector fuzzerLogFile-*.data.yaml or calltree report")
+    p.add_argument("--no-introspector", action="store_true", help="ignore Fuzz Introspector and use AST reachability only")
+    p.add_argument(
+        "--external-source",
+        action="append",
+        help="user-provided library/SDK source directory (read-only context; repeatable)",
+    )
     add_json(p)
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("analyze", help="re-run clang analysis")
     p.add_argument("--workdir", required=True)
+    p.add_argument("--introspector", help="Fuzz Introspector report to use for reachability")
+    p.add_argument("--no-introspector", action="store_true")
     add_json(p)
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("introspect", help="apply Fuzz Introspector reachability and recompute the stub scope")
+    p.add_argument("--workdir", required=True)
+    p.add_argument("--report", help="Fuzz Introspector fuzzerLogFile-*.data.yaml / calltree / JSON")
+    p.add_argument("--run-light", action="store_true", help="run fuzz-introspector's source-only frontend (needs --fi-src)")
+    p.add_argument("--run-lto", action="store_true", help="compile with the Fuzz Introspector LTO pass (needs --fi-clang)")
+    p.add_argument("--fi-clang", help="clang built with the Fuzz Introspector LLVM pass")
+    p.add_argument("--fi-src", help="path to the fuzz-introspector checkout")
+    add_json(p)
+    p.set_defaults(func=cmd_introspect)
 
     p = sub.add_parser("probe", help="compile target+real sources and list unlinkable symbols")
     p.add_argument("--workdir", required=True)
@@ -769,12 +1268,77 @@ def build_parser() -> argparse.ArgumentParser:
     m = msub.add_parser("import")
     m.add_argument("--workdir", required=True)
     m.add_argument("--file", required=True)
+    m.add_argument("--confirm-constraints", action="store_true", help="mark imported input constraints as human-confirmed")
     add_json(m)
     m.set_defaults(func=cmd_mocks_import)
     m = msub.add_parser("clear")
     m.add_argument("--workdir", required=True)
     add_json(m)
     m.set_defaults(func=cmd_mocks_clear)
+
+    p = sub.add_parser("constraints", help="manage the four classes of input constraints")
+    csub = p.add_subparsers(dest="constraints_command", required=True)
+    c = csub.add_parser("list")
+    c.add_argument("--workdir", required=True)
+    c.add_argument("--category", choices=["input_construction", "variable_constraints", "input_relations", "setup_teardown"])
+    c.add_argument("--all", action="store_true", help="include rejected entries")
+    add_json(c)
+    c.set_defaults(func=cmd_constraints_list)
+    c = csub.add_parser("confirm")
+    c.add_argument("--workdir", required=True)
+    c.add_argument("--id", action="append", required=True)
+    add_json(c)
+    c.set_defaults(func=cmd_constraints_confirm)
+    c = csub.add_parser("reject")
+    c.add_argument("--workdir", required=True)
+    c.add_argument("--id", action="append", required=True)
+    c.add_argument("--note")
+    add_json(c)
+    c.set_defaults(func=cmd_constraints_reject)
+    c = csub.add_parser("import")
+    c.add_argument("--workdir", required=True)
+    c.add_argument("--file", required=True)
+    c.add_argument("--source", default="user")
+    c.add_argument("--confirm", action="store_true")
+    add_json(c)
+    c.set_defaults(func=cmd_constraints_import)
+    c = csub.add_parser("draft")
+    c.add_argument("--workdir", required=True)
+    c.add_argument("--mode", choices=["prompt", "claude-cli", "anthropic-api", "api"], default="prompt")
+    c.add_argument("--file")
+    add_json(c)
+    c.set_defaults(func=cmd_constraints_draft)
+
+    p = sub.add_parser("externals", help="register user-provided library/SDK source directories")
+    esub = p.add_subparsers(dest="externals_command", required=True)
+    e = esub.add_parser("add")
+    e.add_argument("--workdir", required=True)
+    e.add_argument("--path", required=True)
+    e.add_argument("--name")
+    e.add_argument("--link", action="store_true", help="treat the source as production code and add it to sources.real")
+    e.add_argument("--include-dir", action="append")
+    e.add_argument("--define", action="append")
+    e.add_argument("--std")
+    add_json(e)
+    e.set_defaults(func=cmd_externals_add)
+    e = esub.add_parser("list")
+    e.add_argument("--workdir", required=True)
+    add_json(e)
+    e.set_defaults(func=cmd_externals_list)
+    e = esub.add_parser("remove")
+    e.add_argument("--workdir", required=True)
+    e.add_argument("--path", required=True)
+    e.add_argument("--keep-linked", action="store_true")
+    add_json(e)
+    e.set_defaults(func=cmd_externals_remove)
+    e = esub.add_parser("scan")
+    e.add_argument("--workdir", required=True)
+    add_json(e)
+    e.set_defaults(func=cmd_externals_scan)
+    e = esub.add_parser("inquire")
+    e.add_argument("--workdir", required=True)
+    add_json(e)
+    e.set_defaults(func=cmd_externals_inquire)
 
     p = sub.add_parser("gen", help="generate harness, stubs, dict and seeds")
     p.add_argument("--workdir", required=True)

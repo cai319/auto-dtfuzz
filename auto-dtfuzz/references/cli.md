@@ -61,8 +61,21 @@ alone; source-coverage tables and `optimize` need `coverage_ok`.
 dtfuzz init --repo PATH --entry NAME [--source FILE] [--workdir DIR] \
   [--include DIR]... [--define NAME=VALUE]... [--std STD] \
   [--language c|cpp] [--build-system make|cmake|...] [--force] \
-  [--no-real-scan] --json
+  [--no-real-scan] [--introspector REPORT] [--no-introspector] \
+  [--external-source DIR]... --json
 ```
+
+`--external-source DIR` registers a user-provided library/SDK source directory
+before analysis, adds its root/includes to the clang include path, and scans it
+read-only for function/macro/type context. Use it when a missing external
+header blocks `init`; it does not link source files. See
+`references/external-sources.md`.
+
+`--introspector REPORT` points at a Fuzz Introspector
+`fuzzerLogFile-*.data.yaml` or calltree. Without it, `init` auto-discovers
+common locations (`out/introspector/`, `build/out/introspector/`,
+`introspector/`, `.dtfuzz/*/introspector/`, repo root). `--no-introspector`
+disables discovery and uses the AST call graph only.
 
 `--no-real-scan` analyzes only the entry and does not pull in cross-module
 sources. Use it for large projects with a prebuilt static/shared library: then
@@ -90,11 +103,50 @@ Key JSON fields:
 - `external_symbols`: only symbols with no allowed implementation; includes
   `status` (`missing`, `excluded_only`, `conflict`, `main_only`, `over_cap`).
 - `probe`: `unresolved`, `resolved`, `unclassified_symbols` from the link probe.
-- `pending_mocks`: human mock rules still required.
+- `pending_mocks`: human mock rules still required (reachable symbols only).
+- `reachability`: `report`, `format`, `matched`, `entry.matched`,
+  `reachable_count`, `module_count`, `external_count`, `stub_scope`, `warnings`.
+  Each `stub_scope` item has `symbol`, `status`, `linkage`, `complexity`,
+  `signature`, `defined_in`, `excluded_in`, `in_analysis`. Absent when no
+  report was used.
+- `external_symbols[].reachable` / `.scope`: `reachable`, `unreachable`, or
+  `unknown` (not present in the report; kept conservatively).
+- `external_symbols[].external_source`: `{file, line, comment, snippet,
+  source_name}` when a registered external directory defines the symbol.
+- `external_source_summary`: registered dirs, matched functions/macros/types,
+  resolved includes, question count.
+- `external_source_questions`: `kind: function` / `kind: include` entries to ask
+  the user about; also `external_macros`, `external_types`, `external_includes`.
 - `mocks_path`, `mock_questions`, `analysis_questions`, `warnings`.
 
 If the probe fails, the candidates fall back to the definition scan and the
 warnings explain that build-time link errors are authoritative.
+
+### analyze
+
+```sh
+dtfuzz analyze --workdir DIR [--introspector REPORT] [--no-introspector] --json
+```
+
+Re-runs clang analysis with the config's source set. With a report, it applies
+the reachability filter (calls from explicitly unreachable callers are skipped;
+unreachable pending mocks are pruned), re-runs the link probe, and refreshes
+`analysis.json` and `introspector/reachability.json`.
+
+### introspect
+
+```sh
+dtfuzz introspect --workdir DIR [--report PATH] [--json]
+dtfuzz introspect --workdir DIR --run-light --fi-src PATH [--json]
+dtfuzz introspect --workdir DIR --run-lto --fi-clang PATH [--fi-src PATH] [--json]
+```
+
+Applies a Fuzz Introspector report to an existing workspace and recomputes the
+stub scope. `--run-light` uses fuzz-introspector's source-only tree-sitter
+frontend (no custom clang; `linkageType` is empty). `--run-lto` compiles with
+the Fuzz Introspector LTO pass (Linux + gold; requires a custom clang from
+fuzz-introspector's `build_all.sh`). This re-runs analysis, the link probe, and
+the mock merge; see `references/reachability.md`.
 
 ### probe
 
@@ -153,8 +205,10 @@ dtfuzz mocks import --workdir DIR --file patches.json --json
 dtfuzz mocks clear --workdir DIR --json
 ```
 
-`mocks list` shows `confirmed`, `status`, `return`, `return_sequence`,
-`out_params`, `source`, and the mocks path. Pending entries are not generated.
+`mocks list` shows `confirmed`, `status`, `reachable`, `scope`, `return`,
+`return_sequence`, `out_params`, `source`, the mocks path, and any constraints
+with `[REVIEW]` / `[OK]` markers. Pending entries are not generated;
+unreachable pending entries are pruned during analysis.
 
 `mocks set` sets `confirmed: true`. `mocks import` accepts either
 `{"symbols": {...}}` or a flat symbol map; imported entries are marked
@@ -179,6 +233,57 @@ merges `variables`. Rule examples:
 Return modes: `fixed` (`{"value":"0"}`), `random_choice` (`values`),
 `random_error` (`success` + `errors`). Out-param modes: `zero`, `fill`, `set`,
 `set_field`, `random_bytes`, `random_hex_string`, `raw`.
+
+### constraints
+
+```sh
+dtfuzz constraints list --workdir DIR [--category input_construction] [--all] --json
+dtfuzz constraints confirm --workdir DIR --id ID [--id ID]... --json
+dtfuzz constraints reject  --workdir DIR --id ID [--note TEXT] --json
+dtfuzz constraints import  --workdir DIR --file FILE [--source user] [--confirm] --json
+dtfuzz constraints draft   --workdir DIR [--mode prompt|claude-cli|anthropic-api|api] --json
+dtfuzz constraints draft   --workdir DIR --file RESULT.json --json
+```
+
+The four classes are `input_construction`, `variable_constraints`,
+`input_relations`, and `setup_teardown`. Drafts are stored with
+`confirmed: false` and `review.highlight: true`; `constraints list` prints
+`[REVIEW]` for them. Only confirmed items are authoritative in the optimizer
+prompt. `setup_teardown` is advisory until the human confirms the exact call
+and ordering; then it can be mapped to `harness.init_code` / `reset_code`.
+
+`constraints draft --mode prompt` writes `optimizer/constraints-prompt.md` and
+returns its path. Give the prompt to the LLM (or answer it yourself), save the
+JSON, then import with `--file` (or `constraints import`). `--file` on the draft
+command is the import path.
+
+`mocks import` also accepts a top-level `constraints` object; use
+`--confirm-constraints` only for an already-reviewed file. `mocks clear`
+preserves constraints.
+
+### externals
+
+```sh
+dtfuzz externals add --workdir DIR --path DIR [--name NAME] [--link] \
+  [--include-dir DIR]... [--define NAME=VALUE]... [--std STD] --json
+dtfuzz externals list   --workdir DIR --json
+dtfuzz externals remove --workdir DIR --path DIR [--keep-linked] --json
+dtfuzz externals scan   --workdir DIR --json
+dtfuzz externals inquire --workdir DIR --json
+```
+
+Registers a user-provided library/SDK source directory (mounted/external). The
+scanner is read-only: it indexes function definitions, `#define` macros,
+typedef/struct/enum types, and module `#include`s. Results are attached to
+`analysis.json` and shown in `optimize` / `constraints draft` prompts and
+`report.md`. `init`, `mocks list`, `probe`, and `externals inquire` expose
+`external_source_questions` for symbols/headers still missing source.
+
+`--link` treats the directory as production code: adds its `.c/.cc` files to
+`sources.real` and its include dirs/defines to the build config, then re-runs
+analysis/probe. Use it only with explicit user approval; the default is
+context-only. `externals remove` unlinks by default; `--keep-linked` keeps the
+files in `sources.real`.
 
 ### gen
 
@@ -353,6 +458,24 @@ dtfuzz clean --workdir DIR [--all|--build|--coverage|--corpus|--artifacts] --jso
     "max_seeds_per_round": 32,
     "max_seed_bytes": 4096
   },
+  "introspector": {
+    "report": "",
+    "auto": true,
+    "fi_clang": "",
+    "fi_src": "",
+    "python": "python3"
+  },
+  "external_sources": [
+    {
+      "name": "secure-c",
+      "path": "/opt/secure-c",
+      "link": false,
+      "include_dirs": ["/opt/secure-c/include"],
+      "defines": [],
+      "std": "",
+      "added_at": "..."
+    }
+  ],
   "harness": {
     "reset_code": "",
     "init_code": "",
@@ -375,6 +498,16 @@ dtfuzz clean --workdir DIR [--all|--build|--coverage|--corpus|--artifacts] --jso
 `mocks.dir`/`config_file`/`generated_file` are optional overrides. Empty values
 mean `<repo>/fuzz_mocks/<module>/`. `auto_stub` is false by default; the CLI
 never fabricates mocks unless the caller passes `--auto-stub`.
+
+`introspector.report` pins a Fuzz Introspector report; empty means
+auto-discover. `auto` is the discovery switch used by `init`/`analyze`.
+`fi_clang`/`fi_src`/`python` are used by `introspect --run-lto` /
+`--run-light`. See `references/reachability.md`.
+
+`external_sources` is the user-provided mounted library/SDK registry. The
+default `link: false` means read-only context for mock/constraint analysis.
+`--link` adds the source files and include dirs to the normal build config. See
+`references/external-sources.md`.
 
 `input_model`: `buffer` (whole input is the buffer), `typed_buffer` (first
 `type_offset + type_bytes` bytes select the message type), or `custom` (use
@@ -409,8 +542,16 @@ Parameter roles: `msg_type`, `buffer`, `buffer_len`, `constant`, `custom`.
       },
       "body": "",
       "source": "user",
+      "reachable": true,
+      "scope": "stub_scope",
       "note": "human rule: fail randomly; always set code 0x99 on success"
     }
+  },
+  "constraints": {
+    "input_construction": [],
+    "variable_constraints": [],
+    "input_relations": [],
+    "setup_teardown": []
   },
   "variables": {
     "g_config": {"type": "struct config", "decl_file": "/abs/repo/include/config.h", "value": "{0}"}
@@ -421,8 +562,16 @@ Parameter roles: `msg_type`, `buffer`, `buffer_len`, `constant`, `custom`.
 Keys are `qualified_name`, or `qualified_name@<type>` for overloads.
 `confirmed: false` means pending: the entry is listed but not generated, and the
 build reports it as unresolved. `source` is one of `pending`, `default`, `auto`,
-`user`, `import`, `optimizer`. `init --force` keeps confirmed user entries and
-refreshes/prunes pending entries.
+`user`, `import`, `optimizer`. `reachable`/`scope` are refreshed by
+`init`/`analyze`/`introspect`; pending entries with `reachable: false` are
+pruned. `init --force` keeps confirmed user entries and refreshes/prunes pending
+entries.
+
+Constraint entries have `id`, `category`, `subject`, `requirement`, `reason`,
+`evidence`, `applies_to`, `confirmed`, `source`, `status`, `note`, and
+`review.highlight`. Drafts are unconfirmed and highlighted; only confirmed
+constraints are authoritative. See `references/mock-config.md` for the full
+schema.
 
 Return rules:
 

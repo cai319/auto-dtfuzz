@@ -10,7 +10,10 @@ description: >-
   wants coverage feedback to automatically raise line/function coverage.
   Also trigger when the user says things like "对这个入口做 fuzz", "给这个模块
   打桩测一下", "消息入口测试", "生成 fuzz 用例", "覆盖率优化", "mock 周边函数",
-  even if they only name a function and do not say "fuzz".
+  even if they only name a function and do not say "fuzz". Use it when the user
+  mentions Fuzz Introspector, fuzzerLogFile-*.data.yaml, reachability or
+  "打桩范围", or asks to draft input constraints (input_construction,
+  variable_constraints, input_relations, setup_teardown).
 ---
 
 # dtfuzz: coverage-guided message-entry fuzzing
@@ -33,6 +36,12 @@ libFuzzer runtime and a matching `llvm-cov` / `llvm-profdata`.
 - **Link real implementations first.** Scan the whole repo for definitions
   (cross-module is expected) and link them. Only functions with no allowed
   implementation are mock candidates.
+- **Prefer the Fuzz Introspector static map for the stub boundary.** When a
+  `fuzzerLogFile-*.data.yaml` / calltree report is available, run
+  `dtfuzz introspect` and treat `reachability.stub_scope` as the deterministic
+  set of external symbols. Do not stub functions the report proves unreachable
+  from the entry. Symbols missing from the report are *unknown*, not
+  unreachable: keep them conservatively and say so in the report.
 - **Never use `dt/` or other excluded fakes.** `dt`, `tests`, `test`, `mock(s)`,
   `stub(s)`, and `fake(s)` directories are excluded by default. Do not link
   them, do not copy their bodies. If a symbol exists only there, treat it as
@@ -42,6 +51,18 @@ libFuzzer runtime and a matching `llvm-cov` / `llvm-profdata`.
   unless the user explicitly asks for a temporary shortcut.
 - **Do not silently invent mock semantics.** Ask the user for return/out/random
   behavior, especially when a result controls a branch.
+- **Input constraints are drafts until reviewed.** The four constraint classes
+  (`input_construction`, `variable_constraints`, `input_relations`,
+  `setup_teardown`) are drafted by the LLM and stored with
+  `review.highlight: true`. Show the `[REVIEW]` items to the human, then
+  `dtfuzz constraints confirm --id ...` or `reject`. Never confirm constraints
+  or translate `setup_teardown` into harness code without the human's decision.
+- **External source directories are read-only by default.** When
+  `external_source_questions` is non-empty, ask the user for a mounted
+  library/SDK source directory before inventing mock semantics. Never link or
+  execute that code with `--link` unless the user explicitly says it is the
+  production implementation. Scanning functions/macros/types is context, not
+  permission to link.
 - **Do not modify the target repository's source.** Workspace files live in
   `<repo>/.dtfuzz/<module>/`; mocks live in a separate human-maintainable
   `<repo>/fuzz_mocks/<module>/`. Report findings instead of patching target code.
@@ -135,6 +156,50 @@ Read the JSON summary:
   invent a signature.
 - `mock_questions` / `analysis_questions`: what is worth asking the user.
 - `warnings`: e.g. “only defined in dt/, not linked”.
+- `reachability`: present when a Fuzz Introspector report was used. Read
+  `reachable_count`, `module_count`, `external_count`, `stub_scope`, and
+  `warnings`. `stub_scope` is the authoritative external-symbol set; each item
+  also carries `status` (`linked_real`, `excluded_only`, `missing`, ...),
+  `linkage`, and `complexity`.
+
+### Reachability from Fuzz Introspector (recommended)
+
+Fuzz Introspector's static map is more reliable than guessing from the AST:
+it knows the functions actually reachable from the entry, including indirect
+calls it could model. Use it whenever the repo has a report:
+
+```sh
+"$DTFUZZ" init --repo "$REPO" --entry "$ENTRY" --source "$SRC" \
+  --workdir "$REPO/.dtfuzz/$MODULE" \
+  --introspector /path/to/fuzzerLogFile-<harness>.data.yaml --json
+```
+
+Without `--introspector`, `init`/`analyze` auto-discover common locations
+(`out/introspector/`, `build/out/introspector/`, `introspector/`,
+`.dtfuzz/*/introspector/`, repo root). Disable with `--no-introspector`.
+To apply or refresh a report later (without re-running `init`):
+
+```sh
+"$DTFUZZ" introspect --workdir "$WORK" --report /path/to/report.data.yaml --json
+```
+
+Ways to get a report, in order of preference:
+
+1. **OSS-Fuzz / CI**: `python3 infra/helper.py introspector PROJECT` writes
+   `fuzzerLogFile-*.data.yaml`.
+2. **LTO pass**: `dtfuzz introspect --workdir "$WORK" --run-lto --fi-clang
+   /path/to/clang [--fi-src ...]`. Needs Linux + gold; unavailable on macOS.
+3. **Light frontend**: `dtfuzz introspect --workdir "$WORK" --run-light
+   --fi-src /path/to/fuzz-introspector`. No custom clang, but `linkageType` is
+   empty and the link probe decides defined/undefined.
+
+Read `module_count` (reachable in-module), `external_count` (reachable outside),
+and `stub_scope` (external reachable joined with the link probe). A
+`linked_real` entry is satisfied; `excluded_only` / `missing` need a mock rule;
+`unknown` is absent from the report and kept conservatively. If no report
+exists, say so and fall back to the AST graph — do not claim the scope is
+deterministic. See `references/reachability.md` for field mapping and
+troubleshooting.
 
 After changing `sources.real`, `sources.exclude`, or `sources.exclude_dirs`,
 re-run the link probe:
@@ -190,6 +255,12 @@ or linking the whole dependency graph through source closure.
 ```sh
 "$DTFUZZ" mocks list --workdir "$WORK" --json
 ```
+
+`mocks list` shows `reachable` and `scope` per symbol. Pending symbols with
+`scope: stub_scope` are in the deterministic external set; `scope: unknown`
+are conservative extras (not in the report); `scope: unreachable` symbols are
+excluded and their pending entries are pruned. Do not add a mock for an
+unreachable symbol unless the user explicitly overrides the report.
 
 For each pending symbol, ask the human for a **structured rule**, not a vague
 “return 0”. Useful rule types:
@@ -257,6 +328,100 @@ Notes:
   candidates and prunes stale auto entries. If the probe now finds a linked
   real implementation for a confirmed mock, the mock is disabled
   (`stub: false`, `status: resolved_real`) so it cannot duplicate the symbol.
+
+## 3.5 Input constraints (four classes)
+
+Mock rules describe *what an external function returns*. They do not describe
+the entry's input contract. Use the four constraint classes adapted from
+OSS-Fuzz-Gen's FunctionAnalyzer. They live in `fuzz_mocks/<module>/mocks.json`
+under `constraints`:
+
+| Class | What it records | Typical effect |
+| --- | --- | --- |
+| `input_construction` | How callers build valid arguments/input buffers (which builder function, field layout, struct initialization). | Seed layout, `harness.call_expr`, dict tokens. |
+| `variable_constraints` | Implicit constraints on a single variable (range, NUL termination, alignment, enum values, nullability). | Seeds and mock body guards. |
+| `input_relations` | Relations between inputs (pointer/size pairs, declared length equals payload length, type selects a payload format). | Seed consistency, mock control offsets. |
+| `setup_teardown` | Functions to call before the entry and state to reset after each input. | `harness.init_code` / `harness.reset_code`, after human confirmation. |
+
+Draft them with the LLM, then review the highlighted items:
+
+```sh
+"$DTFUZZ" constraints draft --workdir "$WORK" --mode prompt --json
+# Read optimizer/constraints-prompt.md, produce one JSON object, then:
+"$DTFUZZ" constraints draft --workdir "$WORK" --file /tmp/constraints.json --json
+"$DTFUZZ" constraints list --workdir "$WORK"          # [REVIEW] = unconfirmed
+"$DTFUZZ" constraints confirm --workdir "$WORK" --id ic-xxxxxxxx
+"$DTFUZZ" constraints reject  --workdir "$WORK" --id vc-xxxxxxxx
+```
+
+Draft JSON shape: `{"constraints": {"input_construction": [item...],
+"variable_constraints": [...], "input_relations": [...],
+"setup_teardown": [...]}}`; each `item` is
+`{"subject": "len", "requirement": "1 <= len <= 31", "reason": "...",
+"evidence": "src/msg_parser.c:47", "applies_to": "entry"}`. Full schema and
+worked examples are in `references/mock-config.md`.
+
+Rules: drafts are `confirmed: false` / `highlight: true` and are not
+authoritative; only confirmed constraints enter the optimizer's "已确认的输入
+约束" section. `setup_teardown` is advisory until the human confirms the exact
+call and ordering, then patch `harness.init_code` / `reset_code` and rerun
+`gen` + `build`. Require `evidence` (file:line) when possible; reject anything
+not supported by the source or callers. Constraints never change mock symbols
+by themselves — if one implies input-dependent behavior, patch the mock `body`
+with `dtfuzz_input_byte` after the human agrees.
+
+## 3.6 External library/SDK source (inquiry)
+
+When the module references functions, macros, or types that are not implemented
+in the repo, do not invent their semantics from the name. Ask the user whether
+the code comes from a secure C library, a platform component, or an SDK, and
+whether they can provide a source directory (a mounted/external directory).
+
+`init`, `mocks list`, and `externals inquire` expose the question list:
+
+```sh
+"$DTFUZZ" externals inquire --workdir "$WORK" --json
+```
+
+If `external_source_questions` is non-empty, ask one compact
+`AskUserQuestion` covering the symbols/headers, for example:
+
+- “这些外部函数/宏/头文件在当前仓库没有实现：`proto_crc32`、`cfg_get_u16`、
+  `secure.h`。它们是否来自某个安全 C 库/平台组件？如果有源码目录（挂载/外挂），
+  请提供路径；我会只读扫描并用于 mock 语义和约束分析。”
+- Options: “我提供源码目录” / “没有源码，按人工规则 mock” / “这些是仓库内实现，重新扫描”.
+
+If the user provides a directory:
+
+```sh
+"$DTFUZZ" externals add --workdir "$WORK" --path /path/to/library \
+  --name secure-c [--include-dir /path/to/include] [--define NAME=VALUE]
+"$DTFUZZ" externals scan --workdir "$WORK" --json
+```
+
+If a missing external header makes `init` fail before a workspace exists, the
+JSON error carries `external_source_questions`; rerun init with
+`--external-source /path/to/library [--include /path/to/include]` (and
+`--force` if a workspace exists) so clang can parse the header. This registers
+the directory for read-only scanning; it does not link it.
+
+The scan returns `matched_functions` (file/line/snippet),
+`matched_macros`/`matched_types` for names the module actually uses,
+`external_includes`, and remaining `external_source_questions`. Use the
+snippets in `optimize` and `constraints draft` prompts, and cite the file:line
+when proposing mock rules or input constraints. The scan is
+**read-only**: nothing is executed and nothing is linked unless the user
+explicitly says the source is production code and asks for linking:
+
+```sh
+"$DTFUZZ" externals add --workdir "$WORK" --path /path/to/library --link ...
+"$DTFUZZ" probe --workdir "$WORK" --json
+```
+
+Never pass `--link` on your own; an external directory is context by default.
+If the user says the external implementation is the real one, link it, re-probe,
+and let `mocks` disable symbols that are now resolved. See
+`references/external-sources.md`.
 
 ## 4. Build
 
@@ -359,8 +524,11 @@ Write one JSON object and import it:
 ```
 
 When the import changes mocks, the CLI regenerates and rebuilds automatically.
-Seed constraints: even-length hex, no `0x`, respect the input layout, at most
-32 seeds and 4096 bytes per seed by default.
+The optimizer prompt includes confirmed input constraints and may return new
+`constraints` drafts in the same JSON. The import stores them as unconfirmed;
+review them with `dtfuzz constraints list` before the next round. Seed
+constraints: even-length hex, no `0x`, respect the input layout, at most 32
+seeds and 4096 bytes per seed by default.
 
 If the optimizer proposes a **new mock rule or changes an existing one**, it is
 not automatically a human-approved rule. Show the proposed symbol/body/return
@@ -410,10 +578,15 @@ fork children abort.
 Present, in Chinese by default:
 
 - Entry signature and input model.
+- Reachability source: Fuzz Introspector report path, entry match, reachable /
+  in-module / external counts, and the external stub scope. If the report is
+  missing, say the scope came from the AST fallback.
 - Line / function / branch coverage with covered/total and target files.
 - Uncovered functions/lines and their classification (seed / mock / unreachable).
 - Crashes with reproduction command and top frames.
-- Mock configuration summary (symbol, return, out params, source).
+- Mock configuration summary (symbol, reachable/scope, return, out params, source).
+- Input constraints: all four classes, with `⚠️ 待审核` highlighted for
+  unconfirmed items. State that they are drafts and do not affect the build yet.
 - Workspace paths: `report.md`, corpus, artifacts, build log.
 - Concrete next actions.
 
@@ -424,7 +597,11 @@ unreachable lines, fixed mock behavior) rather than implying success.
 
 - `references/cli.md` — all commands, config/mocks schema, JSON fields.
 - `references/mock-config.md` — out-param modes, sequences, input-dependent
-  bodies, worked examples.
+  bodies, the four input-constraint classes, worked examples.
+- `references/reachability.md` — Fuzz Introspector report generation, field
+  mapping, entry matching, stub scope, and troubleshooting.
+- `references/external-sources.md` — user-provided library/SDK source
+  directories, function/macro/type scanning, inquiry, and optional linking.
 - `references/coverage-loop.md` — gap classification, seed strategies, stopping
   rules, common failure modes.
 - `references/bug-finding.md` — fork-mode discovery, ASan bug classes, the

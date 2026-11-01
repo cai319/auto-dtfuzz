@@ -1,11 +1,215 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
 
 from .util import DtfuzzError, now_iso, rel_to, write_text
+
+CONSTRAINT_CATEGORIES = {
+    "input_construction": "输入构造方式",
+    "variable_constraints": "变量约束",
+    "input_relations": "输入间关系",
+    "setup_teardown": "setup/teardown",
+}
+
+CONSTRAINT_PREFIXES = {
+    "input_construction": "ic",
+    "variable_constraints": "vc",
+    "input_relations": "ir",
+    "setup_teardown": "st",
+}
+
+
+def default_constraints() -> dict[str, list]:
+    return {key: [] for key in CONSTRAINT_CATEGORIES}
+
+
+def _constraint_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def _constraint_id(category: str, item: dict) -> str:
+    subject = _constraint_text(item.get("subject"))
+    requirement = _constraint_text(item.get("requirement"))
+    digest = hashlib.sha1(f"{category}|{subject}|{requirement}".encode("utf-8")).hexdigest()[:8]
+    return f"{CONSTRAINT_PREFIXES.get(category, category[:2])}-{digest}"
+
+
+def normalize_constraint(category: str, item: Any, source: str = "user", confirmed: bool = False) -> dict | None:
+    if category not in CONSTRAINT_CATEGORIES:
+        return None
+    if isinstance(item, str):
+        item = {"requirement": item}
+    if not isinstance(item, dict):
+        return None
+    requirement = _constraint_text(item.get("requirement") or item.get("text"))
+    if not requirement:
+        return None
+    normalized = {
+        "id": _constraint_text(item.get("id")) or _constraint_id(category, item),
+        "category": category,
+        "subject": _constraint_text(item.get("subject") or item.get("target") or "entry"),
+        "requirement": requirement,
+        "reason": _constraint_text(item.get("reason") or item.get("why")),
+        "evidence": _constraint_text(item.get("evidence") or item.get("source_line") or item.get("file")),
+        "applies_to": _constraint_text(item.get("applies_to") or item.get("target") or "entry"),
+        "confirmed": bool(item.get("confirmed", confirmed)),
+        "source": _constraint_text(item.get("source")) or source,
+        "status": _constraint_text(item.get("status")) or "active",
+        "note": _constraint_text(item.get("note")),
+        "created_at": _constraint_text(item.get("created_at")) or now_iso(),
+    }
+    normalized["review"] = {
+        "highlight": not normalized["confirmed"] and normalized["status"] != "rejected",
+        "note": normalized["note"],
+    }
+    return normalized
+
+
+def merge_constraints(
+    mocks: dict,
+    payload: Any,
+    source: str = "user",
+    confirmed: bool = False,
+) -> list[str]:
+    """Merge LLM/user constraint drafts into mocks.json.
+
+    Confirmed items are never overwritten by an unconfirmed draft.  Drafts are
+    stored with ``confirmed: false`` and ``review.highlight: true`` so the skill
+    can surface them before they influence the harness or seeds.
+    """
+    if not payload:
+        return []
+    constraints = mocks.setdefault("constraints", default_constraints())
+    for key in CONSTRAINT_CATEGORIES:
+        constraints.setdefault(key, [])
+    groups: dict[str, list] = {key: [] for key in CONSTRAINT_CATEGORIES}
+    if isinstance(payload, dict) and isinstance(payload.get("constraints"), dict):
+        payload = payload["constraints"]
+    if isinstance(payload, dict):
+        for key in CONSTRAINT_CATEGORIES:
+            value = payload.get(key)
+            if isinstance(value, list):
+                groups[key].extend(value)
+        # Also accept a flat list under "items" with a category field.
+        for item in payload.get("items", []) if isinstance(payload.get("items"), list) else []:
+            if isinstance(item, dict) and item.get("category") in groups:
+                groups[item["category"]].append(item)
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and item.get("category") in groups:
+                groups[item["category"]].append(item)
+    changed: list[str] = []
+    for category, items in groups.items():
+        existing = {item.get("id"): item for item in constraints.get(category, []) if isinstance(item, dict)}
+        for raw in items:
+            normalized = normalize_constraint(category, raw, source=source, confirmed=confirmed)
+            if not normalized:
+                continue
+            current = existing.get(normalized["id"])
+            if current:
+                if current.get("confirmed") and not normalized.get("confirmed"):
+                    continue
+                for field in ("subject", "requirement", "reason", "evidence", "applies_to", "note"):
+                    if normalized.get(field):
+                        current[field] = normalized[field]
+                if normalized.get("confirmed"):
+                    current["confirmed"] = True
+                if normalized.get("status") and normalized["status"] != "active":
+                    current["status"] = normalized["status"]
+                current["review"] = {
+                    "highlight": not current.get("confirmed", False) and current.get("status") != "rejected",
+                    "note": current.get("note", ""),
+                }
+            else:
+                constraints[category].append(normalized)
+                existing[normalized["id"]] = normalized
+            changed.append(normalized["id"])
+    return list(dict.fromkeys(changed))
+
+
+def constraint_summary(mocks: dict) -> list[dict]:
+    constraints = (mocks or {}).get("constraints") or {}
+    rows = []
+    for category in CONSTRAINT_CATEGORIES:
+        for item in constraints.get(category, []):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "id": item.get("id", ""),
+                    "category": category,
+                    "category_label": CONSTRAINT_CATEGORIES[category],
+                    "subject": item.get("subject", ""),
+                    "requirement": item.get("requirement", ""),
+                    "reason": item.get("reason", ""),
+                    "evidence": item.get("evidence", ""),
+                    "applies_to": item.get("applies_to", "entry"),
+                    "confirmed": bool(item.get("confirmed", False)),
+                    "source": item.get("source", ""),
+                    "status": item.get("status", "active"),
+                    "highlight": bool(
+                        (item.get("review") or {}).get(
+                            "highlight",
+                            not item.get("confirmed", False) and item.get("status", "active") != "rejected",
+                        )
+                    )
+                    and item.get("status", "active") != "rejected",
+                    "note": item.get("note", ""),
+                }
+            )
+    return rows
+
+
+def set_constraint_status(mocks: dict, constraint_id: str, confirmed: bool | None = None, status: str | None = None, note: str | None = None) -> bool:
+    constraints = (mocks or {}).get("constraints") or {}
+    for category in CONSTRAINT_CATEGORIES:
+        for item in constraints.get(category, []):
+            if not isinstance(item, dict) or item.get("id") != constraint_id:
+                continue
+            if confirmed is not None:
+                item["confirmed"] = bool(confirmed)
+            if status is not None:
+                item["status"] = status
+            if note is not None:
+                item["note"] = note
+            item["review"] = {
+                "highlight": not item.get("confirmed", False) and item.get("status") != "rejected",
+                "note": item.get("note", ""),
+            }
+            return True
+    return False
+
+
+def constraints_prompt_section(mocks: dict) -> str:
+    rows = constraint_summary(mocks)
+    confirmed = [item for item in rows if item.get("confirmed") and item.get("status") != "rejected"]
+    pending = [item for item in rows if not item.get("confirmed") and item.get("status") != "rejected"]
+    lines = ["## 已确认的输入约束"]
+    if confirmed:
+        for item in confirmed:
+            lines.append(
+                f"- [{item['category_label']}] {item['subject']}: {item['requirement']}"
+                + (f"（原因：{item['reason']}）" if item["reason"] else "")
+            )
+    else:
+        lines.append("(无)")
+    if pending:
+        lines.append("")
+        lines.append("## 待审核约束（不得当作已确认规则使用）")
+        for item in pending[:20]:
+            lines.append(
+                f"- [{item['category_label']}] {item['subject']}: {item['requirement']}"
+                + (f"（原因：{item['reason']}）" if item["reason"] else "")
+            )
+    return "\n".join(lines)
 
 C_TYPE_HINTS = {
     "void": "void",
@@ -109,6 +313,8 @@ def default_symbol(symbol: dict) -> dict:
         "body": "",
         "source": "pending",
         "note": "",
+        "reachable": symbol.get("reachable", True),
+        "scope": symbol.get("scope", "unknown"),
         "questions": _symbol_questions(symbol),
     }
 
@@ -141,15 +347,36 @@ def merge_defaults(analysis: dict, existing: dict | None) -> dict:
     mocks.setdefault("version", 1)
     mocks.setdefault("symbols", {})
     mocks.setdefault("variables", {})
+    constraints = mocks.setdefault("constraints", {})
+    for key in CONSTRAINT_CATEGORIES:
+        constraints.setdefault(key, [])
     current_names = {
         symbol.get("qualified_name") or symbol.get("name", "")
         for symbol in analysis.get("external_symbols", [])
     }
+    symbol_state = {}
+    for symbol in analysis.get("external_symbols", []):
+        base = symbol.get("qualified_name") or symbol.get("name", "")
+        if base:
+            symbol_state[base] = (symbol.get("reachable", True), symbol.get("scope", "unknown"))
+    for key, entry in mocks["symbols"].items():
+        base = key.split("@", 1)[0]
+        if base in symbol_state:
+            entry["reachable"], entry["scope"] = symbol_state[base]
     for key in list(mocks["symbols"]):
         entry = mocks["symbols"][key]
-        if entry.get("source", "default") in {"default", "auto", "pending"} and key.split("@", 1)[0] not in current_names:
+        auto = entry.get("source", "default") in {"default", "auto", "pending"}
+        if auto and (
+            key.split("@", 1)[0] not in current_names
+            or entry.get("reachable") is False
+        ):
             del mocks["symbols"][key]
     for symbol in analysis.get("external_symbols", []):
+        if symbol.get("reachable") is False:
+            # Reachability says this function is unreachable from the entry.
+            # Never create a new pending mock for it; existing confirmed rules
+            # are preserved for reference.
+            continue
         name = symbol.get("name", "")
         if not name:
             continue
@@ -168,6 +395,8 @@ def merge_defaults(analysis: dict, existing: dict | None) -> dict:
             current.setdefault("is_method", bool(symbol.get("is_method")))
             current.setdefault("stub", True)
             current.setdefault("confirmed", False)
+            current["reachable"] = symbol.get("reachable", True)
+            current["scope"] = symbol.get("scope", "unknown")
             if not current.get("confirmed", False):
                 current["status"] = symbol.get("status", "missing")
                 current["excluded_definition_files"] = symbol.get("excluded_definition_files", [])
@@ -203,6 +432,8 @@ def set_symbol(mocks: dict, name: str, patch: dict) -> dict:
             "body": "",
             "source": "user",
             "note": "",
+            "reachable": True,
+            "scope": "unknown",
             "questions": [],
         }
     symbols[name].update(patch)
@@ -457,6 +688,8 @@ def summary(mocks: dict) -> list[dict]:
                 "return_sequence": symbol.get("return_sequence", []),
                 "out_params": symbol.get("out_params", {}),
                 "source": symbol.get("source", "default"),
+                "reachable": symbol.get("reachable", True),
+                "scope": symbol.get("scope", "unknown"),
                 "questions": symbol.get("questions", []),
             }
         )

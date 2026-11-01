@@ -10,6 +10,10 @@
 
 > 目标场景：给一个消息分发/解析函数（例如 `msg_dispatch(uint8_t type, const uint8_t *buf, size_t len)`）快速搭建可运行的 libFuzzer 工程，并把“真实链接优先、只对无法链接的函数打桩、人工确认 mock 语义”的流程固化下来。
 
+> 可选接入 **Fuzz Introspector 静态可达图**：用 `fuzzerLogFile-*.data.yaml` 的 `functionsReached` 计算从入口可达的函数集合，把打桩范围收紧为“可达且不在目标模块内”的符号；同时把 OSS-Fuzz-Gen FunctionAnalyzer 的四类输入约束（输入构造 / 变量约束 / 输入间关系 / setup-teardown）作为 `mocks.json` 的 schema，由 LLM 起草、人工审核高亮项。
+>
+> 支持 **外挂库/SDK 源码询问机制**：当模块引用了仓库内没有实现的函数、宏、类型或头文件时，`init` / `mocks list` / `externals inquire` 会输出询问项；你提供安全 C 库/平台组件的源码目录后，工具只读扫描函数定义、`#define`、typedef/struct/enum 和头文件，把上下文用于 mock 语义与输入约束分析。默认不链接、不执行。
+
 ---
 
 ## 目录结构
@@ -26,11 +30,14 @@ dtfuzz-skill/
     │   └── dtfuzz/                   # Python CLI 实现（仅标准库）
     ├── references/
     │   ├── cli.md                    # 命令、config.json、mocks.json 字段
-    │   ├── mock-config.md            # mock 规则与示例
+    │   ├── mock-config.md            # mock 规则、四类输入约束与示例
+    │   ├── reachability.md           # Fuzz Introspector 报告、可达闭包与打桩范围
+    │   ├── external-sources.md       # 外挂库/SDK 源码询问、函数/宏/类型扫描
     │   ├── coverage-loop.md          # 覆盖率缺口分类与优化策略
     │   ├── bug-finding.md            # fork 模式与 ASan 崩溃挖掘
     │   ├── platforms.md              # macOS / WSL / Linux 工具链
     │   └── oss-fuzz-gen-notes.md     # 设计参考
+    ├── tests/                        # 解析/约束单元测试与报告 fixture
     └── evals/
         └── evals.json                # 回归测试用例定义
 ```
@@ -384,6 +391,74 @@ Mock 文件位置：
 
 ---
 
+## Fuzz Introspector 可达性与打桩范围
+
+如果仓库已有 Fuzz Introspector 报告（OSS-Fuzz 的 `helper.py introspector`、本地 LTO pass，或 `--run-light` 的源码前端），`init` 会自动发现并应用；也可以显式指定：
+
+```sh
+dtfuzz init --repo /repo --entry msg_dispatch --source src/msg_parser.c \
+  --workdir /repo/.dtfuzz/msg --introspector /path/fuzzerLogFile-*.data.yaml --json
+
+# 已有 workspace 时重新应用
+dtfuzz introspect --workdir /repo/.dtfuzz/msg --report /path/report.data.yaml --json
+```
+
+行为：
+
+- 从入口做 `functionsReached` 传递闭包，得到可达函数集合。
+- 可达函数按 `functionSourceFile` 分成模块内 / 模块外；**只有“模块外 + 无法链接”的可达符号进入 `stub_scope`**。
+- 报告中明确存在但不可达的符号会被排除，pending mock 也会被清理。
+- 不在报告中的符号（间接调用/前端遗漏）标记为 `unknown`，按保守策略保留并给出 warning，避免漏桩。
+- `analysis.json` / `introspector/reachability.json` 记录 `reachable_count`、`module_count`、`external_count`、`stub_scope` 和 warnings；`report.md` 增加“可达性与打桩范围”章节。
+
+生成报告的方式（优先级从高到低）：OSS-Fuzz introspector、Fuzz Introspector LTO pass（`introspect --run-lto --fi-clang ...`，Linux + gold）、源码 light 前端（`introspect --run-light --fi-src ...`，无需自定义 clang，但 `linkageType` 为空）。细节见 `auto-dtfuzz/references/reachability.md`。
+
+## 输入约束（四类）
+
+`mocks.json` 新增 `constraints`，把入口的输入契约拆成四类：
+
+| 类别 | 内容 |
+| --- | --- |
+| `input_construction` | 调用方如何构造合法参数/输入缓冲区（builder 函数、字段顺序、结构体布局） |
+| `variable_constraints` | 单变量约束（范围、NUL 结尾、对齐、枚举值、可空性） |
+| `input_relations` | 输入之间的关系（指针/长度、declared length == payload、type 决定格式） |
+| `setup_teardown` | 入口前需要的初始化与每次输入后的清理 |
+
+流程：
+
+```sh
+dtfuzz constraints draft --workdir /repo/.dtfuzz/msg --mode prompt --json
+# 读取 optimizer/constraints-prompt.md，生成 JSON，然后导入：
+dtfuzz constraints draft --workdir /repo/.dtfuzz/msg --file /tmp/constraints.json --json
+dtfuzz constraints list --workdir /repo/.dtfuzz/msg        # [REVIEW] 为未确认
+dtfuzz constraints confirm --workdir /repo/.dtfuzz/msg --id ic-xxxxxxxx
+dtfuzz constraints reject  --workdir /repo/.dtfuzz/msg --id vc-xxxxxxxx
+```
+
+未确认项始终带 `review.highlight: true`，不会自动应用到 harness；只有 confirmed 约束会作为权威信息进入 optimizer prompt。`setup_teardown` 需要人工确认具体调用和顺序后，再写入 `harness.init_code` / `reset_code`。详见 `auto-dtfuzz/references/mock-config.md`。
+
+## 外挂库/SDK 源码（询问机制）
+
+当分析模块引用了仓库内没有实现的函数、宏、类型或头文件时，工具会询问你是否有对应的安全 C 库/平台组件源码目录：
+
+```sh
+dtfuzz externals inquire --workdir /repo/.dtfuzz/msg --json   # 查看询问项
+dtfuzz externals add --workdir /repo/.dtfuzz/msg \
+  --path /opt/secure-c --name secure-c --include-dir /opt/secure-c/include
+dtfuzz externals scan --workdir /repo/.dtfuzz/msg --json
+```
+
+扫描是**只读**的，覆盖：
+
+- 函数定义（签名、注释、函数体片段）
+- `#define` 宏（名称、值、参数、源码位置）
+- typedef / struct / union / enum / using 类型
+- 模块 `#include` 的头文件解析；缺失的系统头之外的头文件会变成询问项
+
+结果会挂到 `analysis.json` 的 `external_symbols[].external_source`、`external_macros`、`external_types`、`external_includes`，并进入 `optimize` / `constraints draft` 的 prompt 和 `report.md`。
+
+默认 `link=false`，只作为 mock/约束分析上下文；只有你明确说“这是生产实现”时才加 `--link`，把源码加入 `sources.real` 并重新 `probe`，已解析的符号会自动停用 mock。详见 `auto-dtfuzz/references/external-sources.md`。
+
 ## 覆盖率与产物
 
 工作区结构：
@@ -473,6 +548,9 @@ Mock 文件位置：
 - **真实链接优先**：全仓扫描定义（允许跨模块），有真实实现就链接，不要 mock。
 - **默认排除假实现目录**：`dt`、`tests`、`test`、`mock`、`mocks`、`stub`、`stubs`、`fake`、`fakes`、`fuzz_mocks`。不要链接，也不要复制其中的函数体。
 - **Mock 语义由人确认**：不要自行编造返回值/out 参数行为；未确认的 mock 不生成。
+- **打桩范围优先用 Fuzz Introspector 可达图**：有报告时只对“可达且不在模块内”的符号打桩；不可达符号不生成 pending mock；报告中缺失的符号标为 `unknown`，保守保留并说明。
+- **四类输入约束是草案**：LLM 起草的 `constraints` 默认 `confirmed: false`，必须人工 review/confirm 后才作为权威规则；`setup_teardown` 不能自动写进 harness。
+- **外挂源码默认只读**：`externals add` 只扫描函数/宏/类型/头文件作为分析上下文；没有用户明确确认“这是生产实现”时，不得使用 `--link` 链接或执行外部代码。
 - **不要修改目标仓库源码**：工作区在 `.dtfuzz`，mock 在 `fuzz_mocks`，只报告发现，不改业务代码。
 - **只在有授权的目标上 fuzz**：保持 libFuzzer 资源限制，不要对网络服务或破坏性目标运行。
 - **不要手改生成文件**：改 `config.json` 或 `mocks.json`，再 `gen`/`build`。
@@ -602,6 +680,6 @@ git ls-files | head
 
 ## 版本
 
-当前 CLI 版本：`0.1.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
+当前 CLI 版本：`0.3.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
 
 更详细的命令、字段和扩展点见 `auto-dtfuzz/references/`。

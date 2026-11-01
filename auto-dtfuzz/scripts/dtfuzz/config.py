@@ -71,6 +71,14 @@ DEFAULT_CONFIG: dict = {
         "max_seeds_per_round": 32,
         "max_seed_bytes": 4096,
     },
+    "introspector": {
+        "report": "",
+        "auto": True,
+        "fi_clang": "",
+        "fi_src": "",
+        "python": "python3",
+    },
+    "external_sources": [],
     "harness": {
         "reset_code": "",
         "init_code": "",
@@ -167,6 +175,14 @@ class Workspace:
         return self.root / "crashes"
 
     @property
+    def introspector_dir(self) -> Path:
+        return self.root / "introspector"
+
+    @property
+    def reachability_path(self) -> Path:
+        return self.introspector_dir / "reachability.json"
+
+    @property
     def binary_path(self) -> Path:
         return self.build_dir / "fuzz_target"
 
@@ -182,6 +198,7 @@ class Workspace:
             self.runs_dir,
             self.optimizer_dir,
             self.crashes_dir,
+            self.introspector_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         ignore = self.root / ".gitignore"
@@ -203,10 +220,11 @@ class Workspace:
             path = self.mocks_path
         data = read_json(path, default=None)
         if data is None:
-            return {"version": 1, "symbols": {}, "variables": {}}
+            return {"version": 1, "symbols": {}, "variables": {}, "constraints": {}}
         data.setdefault("version", 1)
         data.setdefault("symbols", {})
         data.setdefault("variables", {})
+        data.setdefault("constraints", {})
         return data
 
     def save_mocks(self, mocks: dict, config: dict | None = None) -> None:

@@ -1,0 +1,320 @@
+All functions:
+  Elements:
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 3
+    argNames:
+    - type
+    - buf
+    - len
+    argTypes:
+    - uint8_t
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: msg_dispatch
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached:
+    - parse_ping
+    - parse_data
+    - parse_config
+    - reply_send
+    - logger_write
+    linkageType: externalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - buf
+    - len
+    argTypes:
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: parse_ping
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached: []
+    linkageType: internalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - buf
+    - len
+    argTypes:
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: parse_data
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached:
+    - proto_crc32
+    - table_lookup
+    linkageType: internalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - buf
+    - len
+    argTypes:
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: parse_config
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached:
+    - cfg_get_u16
+    linkageType: internalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - buf
+    - len
+    argTypes:
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: parse_event
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached:
+    - peer_lookup
+    linkageType: internalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 2
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 1
+    argNames:
+    - key
+    argTypes:
+    - uint16_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: table_lookup
+    functionSourceFile: src/msg_tables.c
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: uint8_t
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - level
+    - text
+    argTypes:
+    - int
+    - const char *
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: logger_write
+    functionSourceFile: deps/logger.c
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: void
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - data
+    - len
+    argTypes:
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: proto_crc32
+    functionSourceFile: <external>
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - key
+    - out
+    argTypes:
+    - const char *
+    - uint16_t *
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: cfg_get_u16
+    functionSourceFile: <external>
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 2
+    argNames:
+    - id
+    - out
+    argTypes:
+    - uint32_t
+    - config_reply_t *
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: peer_lookup
+    functionSourceFile: <external>
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 3
+    argNames:
+    - type
+    - payload
+    - len
+    argTypes:
+    - uint8_t
+    - const uint8_t *
+    - size_t
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: reply_send
+    functionSourceFile: <external>
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 0
+    argNames: []
+    argTypes: []
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: unrelated_helper
+    functionSourceFile: src/msg_parser.c
+    functionUses: 1
+    functionsReached:
+    - unused_external
+    linkageType: internalLinkage
+    returnType: int
+  
+  - BBCount: 3
+    BranchProfiles: []
+    CyclomaticComplexity: 3
+    EdgeCount: 2
+    ICount: 1
+    IfCount: 1
+    argCount: 0
+    argNames: []
+    argTypes: []
+    constantsTouched: []
+    functionDepth: 1
+    functionLinenumber: 1
+    functionLinenumberEnd: -1
+    functionName: unused_external
+    functionSourceFile: <external>
+    functionUses: 1
+    functionsReached: []
+    linkageType: externalLinkage
+    returnType: int
+  
+  Function list name: All functions
+Fuzzer filename: src/msg_parser.c

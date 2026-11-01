@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .introspect import name_state
 from .util import (
     DtfuzzError,
     is_within,
@@ -397,6 +398,30 @@ def _resolve_file(value: str | None, repo: str | Path) -> str:
         return str(path)
 
 
+def _call_state(call: dict, reachability: dict | None) -> str:
+    if not reachability or not reachability.get("matched"):
+        return "unknown"
+    names = [call.get("name", ""), call.get("mangled_name", ""), call.get("qualified_name", "")]
+    states = [name_state(name, reachability) for name in names if name]
+    if "reachable" in states:
+        return "reachable"
+    if states and all(state == "unreachable" for state in states):
+        return "unreachable"
+    return "unknown"
+
+
+def _caller_reachable(call: dict, reachability: dict | None) -> bool:
+    if not reachability or not reachability.get("matched"):
+        return True
+    caller = call.get("caller", "")
+    if not caller:
+        return True
+    # Only skip a caller that the report explicitly contains but marks as not
+    # reachable.  An unknown caller may be an indirect call or a frontend gap;
+    # dropping its calls would cause missed stubs.
+    return name_state(caller, reachability) != "unreachable"
+
+
 def _handle_calls(
     calls: list[dict],
     index: AstIndex,
@@ -404,6 +429,7 @@ def _handle_calls(
     entry_file: str,
     compiled_files: set[str],
     def_index: dict[str, list[str]],
+    reachability: dict | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     internal: list[dict] = []
     external: list[dict] = []
@@ -411,6 +437,14 @@ def _handle_calls(
     unknown: list[dict] = []
     repo_path = Path(repo).resolve()
     for call in calls:
+        # Calls inside functions that Fuzz Introspector proves unreachable from
+        # the target entry are not part of the link closure and must not create
+        # mock candidates.  This is the main over-stubbing guard.
+        if not _caller_reachable(call, reachability):
+            continue
+        state = _call_state(call, reachability)
+        call["reachable"] = state != "unreachable"
+        call["scope"] = state
         decl, candidates = _best_decl(index, call)
         body_decls = [item for item in candidates if item.get("has_body")]
         project_decls = [item for item in candidates if item.get("file") and is_within(_resolve_file(item["file"], repo), repo_path)]
@@ -421,9 +455,11 @@ def _handle_calls(
             continue
         if project_decls:
             decl = project_decls[0]
-            file_value = _resolve_file(decl.get("file"), repo)
+            file_value = _resolve_file(decl["file"], repo)
             definition_files = def_index.get(call.get("name", ""), [])
             definition_files = [str(Path(item).resolve()) for item in definition_files if is_within(item, repo_path)]
+            if not call["reachable"]:
+                call["status"] = "unreachable"
             external.append(
                 {
                     **call,
@@ -541,6 +577,7 @@ def analyze_repo(
     std: str,
     max_files: int = 200,
     exclude_dirs: set[str] | None = None,
+    reachability: dict | None = None,
 ) -> dict:
     repo_path = Path(repo).resolve()
     warnings: list[str] = []
@@ -632,7 +669,7 @@ def analyze_repo(
             current_text = current.read_text(encoding="utf-8", errors="replace")
             current_calls = collect_calls_ast(current_index, line_offset_map(current_text))
         internal, external, system, unknown = _handle_calls(
-            current_calls, current_index, repo_path, str(entry_path), compiled_files, def_index
+            current_calls, current_index, repo_path, str(entry_path), compiled_files, def_index, reachability
         )
         internal_calls.extend(internal)
         external_calls.extend(external)
@@ -640,6 +677,8 @@ def analyze_repo(
         unknown_calls.extend(unknown)
         cap_warned = False
         for call in external:
+            if call.get("reachable") is False:
+                continue
             name = call.get("name", "")
             definition_files = call.get("definition_files") or []
             excluded_files = excluded_def_index.get(name, [])
@@ -732,6 +771,8 @@ def analyze_repo(
                 "is_method": bool(decl.get("is_method")),
                 "mangled_name": call.get("mangled_name") or decl.get("mangled_name", ""),
                 "status": status,
+                "reachable": bool(call.get("reachable", True)),
+                "scope": call.get("scope", "unknown"),
             }
         )
 
@@ -764,10 +805,24 @@ def analyze_repo(
                 "options": ["缓冲区+长度", "类型字段+缓冲区+长度", "需要自定义调用代码"],
             }
         )
+    unreachable = [item for item in external_symbols if item.get("reachable") is False]
+    if unreachable:
+        warnings.append(
+            f"Fuzz Introspector 判定 {len(unreachable)} 个外部函数不可达，已排除在打桩范围外："
+            + ", ".join(item.get("name", "") for item in unreachable[:10])
+        )
+    unknown_scope = [item for item in external_symbols if item.get("scope") == "unknown"]
+    if unknown_scope:
+        warnings.append(
+            f"{len(unknown_scope)} 个外部函数不在 Fuzz Introspector 报告中（可能是间接调用或前端遗漏），"
+            "按保守策略保留为待确认打桩候选："
+            + ", ".join(item.get("name", "") for item in unknown_scope[:10])
+        )
     pending = [
         item
         for item in external_symbols
         if item.get("status") in {"missing", "excluded_only", "conflict", "main_only", "over_cap"}
+        and item.get("reachable", True)
     ]
     if pending:
         questions.append(

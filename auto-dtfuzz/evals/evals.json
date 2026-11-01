@@ -28,6 +28,13 @@
       "prompt": "对 /REPO 的 c-bug-zoo 模块做 libFuzzer 崩溃挖掘，入口 src/bug_zoo.c 的 bug_dispatch(uint8_t type, const uint8_t *buf, size_t len)。目标是找内存安全问题（堆/栈/全局越界、UAF、double free、空指针等），单轮 15-20 秒；用 fork 模式继续跑过崩溃，收集所有可区分的 sanitizer 签名和可复现输入。最后按签名列出漏洞类型、源码行、复现命令，并区分目标代码崩溃与非目标/运行时崩溃。",
       "expected_output": "Six distinct target ASan signatures: heap-buffer-overflow, heap-use-after-free, double-free, stack-buffer-overflow, SEGV in null_deref, global-buffer-overflow, each with a reproducible input; non-target fuzzer crashes listed separately.",
       "files": []
+    },
+    {
+      "id": 4,
+      "name": "introspector-stub-scope-and-constraints",
+      "prompt": "对 /REPO 的 C 消息分发模块做 libFuzzer（dtfuzz）测试，入口 src/msg_parser.c 的 msg_dispatch(uint8_t type, const uint8_t *buf, size_t len)。仓库里有 Fuzz Introspector 报告 out/introspector/fuzzerLogFile-msg.data.yaml。要求：先用报告确定从入口可达的函数集合和打桩范围；只对可达且不在模块内的外部函数打桩，从入口不可达的调用子树不能打桩；仓库里的 dt/ 是旧假实现，绝对不能链接。然后按四类（输入构造方式 / 变量约束 / 输入间关系 / setup-teardown）起草输入约束，把未确认项高亮出来，不要自动确认。mock 规则：proto_crc32、reply_send 返回 0 或随机错误码；cfg_get_u16 返回 0 或 -1、out 写随机定长 2 字节；peer_lookup 返回 0 或 -1、out.code 固定 0x99。单轮 fuzz 控制在 15 秒内。最后说明可达/不可达函数、打桩范围、未确认约束、覆盖率与产物路径。",
+      "expected_output": "reachability.json matches msg_dispatch; stub_scope contains proto_crc32/cfg_get_u16/peer_lookup/reply_send but not unused_lookup; mocks.json has four constraint categories with at least one unconfirmed highlighted item; fuzz binary builds; coverage report and report.md generated; dt/ not linked; source unchanged.",
+      "files": []
     }
   ]
 }

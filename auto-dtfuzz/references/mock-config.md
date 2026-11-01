@@ -36,6 +36,66 @@ pending symbol (`confirmed: false`) is listed in `mocks.json` but is **not
 emitted**; the build fails with that symbol unresolved until a human confirms a
 rule.
 
+## Input constraints (four classes)
+
+`mocks.json` also stores the entry's input contract under `constraints`. These
+are not mock code; they are reviewable facts that guide seeds, mock bodies, and
+harness setup. The schema follows OSS-Fuzz-Gen's FunctionAnalyzer categories:
+
+```json
+{
+  "version": 1,
+  "constraints": {
+    "input_construction": [
+      {
+        "id": "ic-6f2a87f3",
+        "subject": "buf",
+        "requirement": "callers use build_packet(): 1-byte type + 2-byte big-endian length + payload",
+        "reason": "parse_data reads the declared length first",
+        "evidence": "src/msg_parser.c:34",
+        "applies_to": "entry",
+        "confirmed": false,
+        "source": "llm",
+        "status": "active",
+        "review": {"highlight": true, "note": ""}
+      }
+    ],
+    "variable_constraints": [],
+    "input_relations": [],
+    "setup_teardown": []
+  },
+  "symbols": {}
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `input_construction` | How to build valid arguments/input buffers (builder functions, struct layout, field order). |
+| `variable_constraints` | Single-variable constraints: ranges, NUL termination, alignment, enum values, nullability. |
+| `input_relations` | Relations across arguments: pointer/size pairs, declared length == payload, type selects a format. |
+| `setup_teardown` | Calls/state needed before the entry and cleanup after each input. |
+
+Lifecycle:
+
+1. `dtfuzz constraints draft --mode prompt` writes
+   `optimizer/constraints-prompt.md`.
+2. The LLM (or the agent) returns a JSON object with a `constraints` section.
+3. `dtfuzz constraints draft --file result.json` imports it with
+   `confirmed: false` and `review.highlight: true`.
+4. `dtfuzz constraints list` shows `[REVIEW]` items.
+5. `dtfuzz constraints confirm --id ...` or `reject --id ...` records the human
+   decision.
+
+Only confirmed constraints are included as authoritative in the optimizer
+prompt's "已确认的输入约束" section. `setup_teardown` is advisory: translate it
+into `harness.init_code` / `harness.reset_code` only after the human confirms
+the exact call and ordering, then rerun `gen` and `build`.
+
+`mocks import` accepts a top-level `constraints` object alongside `symbols`.
+Use `--confirm-constraints` only when the file was already reviewed by a human.
+`mocks clear` preserves constraints because they describe the entry, not mock
+code.
+
 ## Human rules
 
 `init` creates pending entries with signatures and call sites. Ask the user for

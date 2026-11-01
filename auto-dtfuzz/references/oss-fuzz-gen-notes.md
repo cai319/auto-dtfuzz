@@ -100,7 +100,8 @@ coverage is used for reporting but **never fed to the next prompt**.
 
 ## Iteration and crashes
 
-Defaults: 2 samples, temperature 0.4 (`run_one_experiment.py`). Stops after five
+Defaults: 1 sample, temperature 0.4 (`llm_toolkit/models.py:50-51`;
+`run_all_experiments.py` exposes `--num-samples`/`--temperature`). Stops after five
 cycles, a failed BuildResult, a non-AnalysisResult, or a “successful”
 AnalysisResult (`pipeline.py`). Success means no semantic error, the coverage
 analyzer says no improvement is needed, or a crash is a true bug / the entry
@@ -138,9 +139,11 @@ downstream ClusterFuzz does real deduplication.
   prompt, and accepts structured seeds/dict/mock patches back.
 - **30-second runs and five cycles are shallow** for parser state machines.
   dtfuzz rounds are configurable and stop on target/plateau/max rounds.
-- **No examples/corpus.** oss-fuzz-gen can mine unit tests (it has a
-  TestToHarness converter). dtfuzz mines README hex samples, dictionary tokens,
-  and type constants; unit-test mining is a future extension.
+- **No examples/corpus.** oss-fuzz-gen can mine unit tests (TestToHarness) and
+  has `llm_toolkit/corpus_generator.py` (LLM writes a seed-corpus generation
+  script; `prompts/template_xml/corpus_generation_via_python_script.txt`).
+  dtfuzz mines README hex samples, dictionary tokens, and type constants;
+  unit-test mining is a future extension.
 - **Conservative build edits.** oss-fuzz-gen tries the original build first.
   dtfuzz never edits the target repository; it compiles into
   `<repo>/.dtfuzz/<module>/` and records the exact commands.
@@ -156,6 +159,36 @@ downstream ClusterFuzz does real deduplication.
 | Iteration | 5 cycles, no numeric threshold | target/plateau/max-round config |
 | Crashes | GDB true-bug pipeline | ASan/UBSan + stack dedup + repro |
 | Harness style | project image build.sh | standalone clang build, no repo edits |
+
+## Four input-constraint classes (FunctionAnalyzer)
+
+OSS-Fuzz-Gen's `prompts/agent/function-analyzer-priming.txt` asks the LLM to
+extract implicit requirements from the target function and its callers. The
+requirements cluster into four classes, which auto-dtfuzz adopts as its
+`mocks.json.constraints` schema:
+
+| OSS-Fuzz-Gen wording | auto-dtfuzz key | Examples |
+| --- | --- | --- |
+| Requirements for creating valid input arguments / how callers build them | `input_construction` | builder functions, struct field order, buffer layout |
+| Implicit assumptions about ranges, pointer states, struct members | `variable_constraints` | `1 <= len <= 31`, NUL termination, enum values, non-null |
+| Relationship between inputs | `input_relations` | pointer/size pairs, declared length == payload length, type selects a format |
+| Setup functions to call before the target | `setup_teardown` | `msg_init()`, global registration, per-input reset |
+
+The FunctionAnalyzer returns free-form `<requirement>` strings; auto-dtfuzz
+turns them into structured drafts (`subject`, `requirement`, `reason`,
+`evidence`, `applies_to`), stores them unconfirmed, and requires human review.
+JVM prompts also mention `fuzzerTearDown`; for C/C++ the teardown half is
+usually a per-input reset (`harness.reset_code`).
+
+## Upstream snapshot (2026-03-02, c0982c5)
+
+- Defaults are `NUM_SAMPLES=1`, `TEMPERATURE=0.4` (`llm_toolkit/models.py:50-51`).
+- Languages: C, C++, JVM, Python, Rust (`experiment/benchmark.py`,
+  `llm_toolkit/prompt_builder.py`).
+- Newer tools: `llm_toolkit/corpus_generator.py` (LLM writes a corpus-generation
+  script) and `llm_toolkit/crash_triager.py` (LLM crash triage).
+- `benchmark-sets/all` contains 336 YAML files; the README describes 1300+
+  benchmarks across 297 projects.
 
 ## Key citations
 
