@@ -1,0 +1,33 @@
+{
+  "skill_name": "auto-dtfuzz",
+  "evals": [
+    {
+      "id": 0,
+      "name": "c-link-first-human-mock-dt-excluded",
+      "prompt": "对 /REPO 的 C 消息分发模块做 libFuzzer（dtfuzz）测试，入口 src/msg_parser.c 的 msg_dispatch(uint8_t type, const uint8_t *buf, size_t len)。要求：先全仓找可链接的真实实现并链接；有实现的函数不要再写 mock；仓库里的 dt/ 是旧的测试假实现，绝对不能链接、不能复制其逻辑；只有确实无法链接的函数才 mock，并按以下人工规则：proto_crc32、reply_send 返回 0 或随机错误码（-1/-123）；cfg_get_u16 返回 0 或 -1，out 写入随机定长 2 字节；peer_lookup 返回 0 或 -1，out 结构的 code 固定 0x99。单轮 fuzz 控制在 15 秒内，尽量提高覆盖。最后说明哪些函数真实链接、哪些被 mock、dt/ 是否被排除、覆盖率、不可达行和产物路径。",
+      "expected_output": "deps/logger.c linked as real code, dt/fake_deps.c never linked, confirmed mock rules under fuzz_mocks/<module>/, coverage >=90% on the module, report generated, source unchanged.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "cpp-link-first-human-mock",
+      "prompt": "对 /REPO 的 C++17 模块做 libFuzzer（dtfuzz）测试，入口 netproto::dispatch(std::uint8_t, const std::uint8_t *, std::size_t)，源码 src/parser.cpp。要求：先全仓找可链接的真实实现并链接；有实现的函数不要再写 mock；不要使用任何 mock/stub/fake 目录下的旧实现；只有确实无法链接的函数才 mock，并按以下人工规则：netproto::verify_frame、netproto::send_reply 返回 0 或 -1；netproto::log_write 为 void 空实现；netproto::peer_lookup 返回 0 或 -1，out 结构的 code 固定 0x99。单轮 fuzz 控制在 15 秒内，尽量提高覆盖。最后说明哪些函数真实链接、哪些被 mock、覆盖率与不可达行、产物路径。",
+      "expected_output": "C++ fuzz_target builds, confirmed mocks under fuzz_mocks/<module>/, coverage >=90% with demangled names, report generated, source unchanged.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "c-crash-triage",
+      "prompt": "用 /REPO 的 C 模块跑 dtfuzz，入口是 src/crash_parser.c 的 crash_dispatch(uint8_t type, const uint8_t *buf, size_t len)。目标不是覆盖率，是找出 ASan 崩溃，给我可复现输入和完整栈顶。单轮 fuzz 控制在 15 秒内。",
+      "expected_output": "An ASan crash with a saved reproducer, verified by dtfuzz repro, and a report naming the sanitizer and top frames.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "c-bug-zoo-memory-safety",
+      "prompt": "对 /REPO 的 c-bug-zoo 模块做 libFuzzer 崩溃挖掘，入口 src/bug_zoo.c 的 bug_dispatch(uint8_t type, const uint8_t *buf, size_t len)。目标是找内存安全问题（堆/栈/全局越界、UAF、double free、空指针等），单轮 15-20 秒；用 fork 模式继续跑过崩溃，收集所有可区分的 sanitizer 签名和可复现输入。最后按签名列出漏洞类型、源码行、复现命令，并区分目标代码崩溃与非目标/运行时崩溃。",
+      "expected_output": "Six distinct target ASan signatures: heap-buffer-overflow, heap-use-after-free, double-free, stack-buffer-overflow, SEGV in null_deref, global-buffer-overflow, each with a reproducible input; non-target fuzzer crashes listed separately.",
+      "files": []
+    }
+  ]
+}

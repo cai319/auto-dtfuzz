@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-dtfuzz"
+version = "0.1.0"
+description = "Coverage-guided libFuzzer campaigns for message-entry modules"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+dtfuzz = "dtfuzz.cli:main"
+
+[tool.setuptools]
+packages = ["dtfuzz"]
