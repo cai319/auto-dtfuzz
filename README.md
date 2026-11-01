@@ -652,32 +652,6 @@ rm ~/.claude/skills/auto-dtfuzz
 
 ---
 
-## 维护者：首次推送到 Git
-
-```sh
-cd /path/to/dtfuzz-skill
-
-git init
-git add .
-git commit -m "feat: add auto-dtfuzz skill and installation guide"
-git branch -M main
-git remote add origin <你的仓库地址>
-git push -u origin main
-```
-
-推送前建议确认：
-
-```sh
-git status
-git ls-files | head
-```
-
-仓库中不应包含 `__pycache__/`、`*.pyc`、`.DS_Store`、`.dtfuzz/`、测试语料或崩溃输入；这些已在 `.gitignore` 中忽略。
-
-如果准备公开发布，建议补充 `LICENSE`（当前仓库未声明许可证）。
-
----
-
 ## 版本
 
 当前 CLI 版本：`0.3.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
