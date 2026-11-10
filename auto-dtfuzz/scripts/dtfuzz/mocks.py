@@ -22,6 +22,74 @@ CONSTRAINT_PREFIXES = {
     "setup_teardown": "st",
 }
 
+# A reachable function with any of these statuses has a real definition in
+# project code (outside excluded fake/test dirs) or in a user-provided external
+# component repo.  It must be linked, never mocked.
+REAL_DEFINITION_STATUSES = {"conflict", "main_only", "over_cap", "external_definition"}
+
+
+def is_real_definition(symbol: dict) -> bool:
+    if symbol.get("must_link"):
+        return True
+    if symbol.get("external_source") and not symbol.get("reference_only"):
+        return True
+    return symbol.get("status") in REAL_DEFINITION_STATUSES
+
+
+def matching_real_definition(name: str, analysis: dict) -> dict | None:
+    target = {name}
+    if "::" in name:
+        target.add(name.split("::")[-1])
+    for symbol in analysis.get("external_symbols", []) or []:
+        if not is_real_definition(symbol):
+            continue
+        names = {
+            symbol.get("name", ""),
+            symbol.get("qualified_name", ""),
+            symbol.get("mangled_name", ""),
+        }
+        if target & {item for item in names if item}:
+            return symbol
+    return None
+
+
+def enforce_real_definitions(mocks: dict, analysis: dict) -> list[str]:
+    """Disable any mock that would define a symbol with a real implementation.
+
+    This is the last line of defense: even if a user/LLM/import confirmed a
+    rule earlier, a real definition in the repo or a provided external component
+    repo wins.  ``reference_only`` external sources are the explicit exception.
+    """
+    blocked: list[str] = []
+    for symbol in analysis.get("external_symbols", []) or []:
+        if not is_real_definition(symbol):
+            continue
+        names = {
+            symbol.get("name", ""),
+            symbol.get("qualified_name", ""),
+            symbol.get("mangled_name", ""),
+        }
+        names = {item for item in names if item}
+        for key, entry in (mocks.get("symbols") or {}).items():
+            entry_names = {
+                key.split("@", 1)[0],
+                entry.get("name", ""),
+                entry.get("qualified_name", ""),
+                entry.get("mangled_name", ""),
+            }
+            if not (names & {item for item in entry_names if item}):
+                continue
+            entry["stub"] = False
+            entry["confirmed"] = False
+            entry["status"] = "must_link_real"
+            entry["must_link"] = True
+            entry["note"] = (
+                "blocked: a real definition exists in project/external code; "
+                "link it instead of mocking it"
+            )
+            blocked.append(key)
+    return list(dict.fromkeys(blocked))
+
 
 def default_constraints() -> dict[str, list]:
     return {key: [] for key in CONSTRAINT_CATEGORIES}
@@ -315,6 +383,9 @@ def default_symbol(symbol: dict) -> dict:
         "note": "",
         "reachable": symbol.get("reachable", True),
         "scope": symbol.get("scope", "unknown"),
+        "must_link": is_real_definition(symbol),
+        "external_source": bool(symbol.get("external_source")),
+        "reference_only": bool(symbol.get("reference_only")),
         "questions": _symbol_questions(symbol),
     }
 
@@ -358,11 +429,30 @@ def merge_defaults(analysis: dict, existing: dict | None) -> dict:
     for symbol in analysis.get("external_symbols", []):
         base = symbol.get("qualified_name") or symbol.get("name", "")
         if base:
-            symbol_state[base] = (symbol.get("reachable", True), symbol.get("scope", "unknown"))
+            symbol_state[base] = {
+                "reachable": symbol.get("reachable", True),
+                "scope": symbol.get("scope", "unknown"),
+                "must_link": is_real_definition(symbol),
+                "external_source": bool(symbol.get("external_source")),
+                "reference_only": bool(symbol.get("reference_only")),
+            }
     for key, entry in mocks["symbols"].items():
         base = key.split("@", 1)[0]
         if base in symbol_state:
-            entry["reachable"], entry["scope"] = symbol_state[base]
+            state = symbol_state[base]
+            entry["reachable"] = state["reachable"]
+            entry["scope"] = state["scope"]
+            entry["must_link"] = state["must_link"]
+            entry["external_source"] = state["external_source"]
+            entry["reference_only"] = state["reference_only"]
+            if state["must_link"]:
+                entry["stub"] = False
+                entry["confirmed"] = False
+                entry["status"] = "must_link_real"
+                entry["note"] = (
+                    "blocked: a real definition exists in project/external code; "
+                    "link it instead of mocking it"
+                )
     for key in list(mocks["symbols"]):
         entry = mocks["symbols"][key]
         auto = entry.get("source", "default") in {"default", "auto", "pending"}
@@ -376,6 +466,9 @@ def merge_defaults(analysis: dict, existing: dict | None) -> dict:
             # Reachability says this function is unreachable from the entry.
             # Never create a new pending mock for it; existing confirmed rules
             # are preserved for reference.
+            continue
+        if is_real_definition(symbol):
+            # Real definition in project/external code: link it, never mock it.
             continue
         name = symbol.get("name", "")
         if not name:
@@ -397,7 +490,18 @@ def merge_defaults(analysis: dict, existing: dict | None) -> dict:
             current.setdefault("confirmed", False)
             current["reachable"] = symbol.get("reachable", True)
             current["scope"] = symbol.get("scope", "unknown")
-            if not current.get("confirmed", False):
+            current["must_link"] = is_real_definition(symbol)
+            current["external_source"] = bool(symbol.get("external_source"))
+            current["reference_only"] = bool(symbol.get("reference_only"))
+            if current["must_link"]:
+                current["stub"] = False
+                current["confirmed"] = False
+                current["status"] = "must_link_real"
+                current["note"] = (
+                    "blocked: a real definition exists in project/external code; "
+                    "link it instead of mocking it"
+                )
+            elif not current.get("confirmed", False):
                 current["status"] = symbol.get("status", "missing")
                 current["excluded_definition_files"] = symbol.get("excluded_definition_files", [])
             else:
@@ -434,6 +538,9 @@ def set_symbol(mocks: dict, name: str, patch: dict) -> dict:
             "note": "",
             "reachable": True,
             "scope": "unknown",
+            "must_link": False,
+            "external_source": False,
+            "reference_only": False,
             "questions": [],
         }
     symbols[name].update(patch)
@@ -612,12 +719,21 @@ def render_stubs(mocks: dict, repo: str | Path, lang: str = "c") -> str:
     symbols = [
         symbol
         for symbol in mocks.get("symbols", {}).values()
-        if symbol.get("stub", True) and symbol.get("confirmed", False)
+        if symbol.get("stub", True)
+        and symbol.get("confirmed", False)
+        and not is_real_definition(symbol)
+    ]
+    blocked = [
+        symbol
+        for symbol in mocks.get("symbols", {}).values()
+        if is_real_definition(symbol)
     ]
     pending = [
         symbol
         for symbol in mocks.get("symbols", {}).values()
-        if symbol.get("stub", True) and not symbol.get("confirmed", False)
+        if symbol.get("stub", True)
+        and not symbol.get("confirmed", False)
+        and not is_real_definition(symbol)
     ]
     lines = [
         "/* Generated by dtfuzz. Edit mocks.json, then run `dtfuzz gen` again. */",
@@ -630,6 +746,10 @@ def render_stubs(mocks: dict, repo: str | Path, lang: str = "c") -> str:
     if pending:
         lines.append("/* Pending (not generated until confirmed by a human): " + ", ".join(
             symbol.get("qualified_name") or symbol.get("name", "?") for symbol in pending
+        ) + " */")
+    if blocked:
+        lines.append("/* Blocked (a real definition exists; link it, never mock it): " + ", ".join(
+            symbol.get("qualified_name") or symbol.get("name", "?") for symbol in blocked
         ) + " */")
     lines.extend(_include_lines(symbols, repo))
     lines.extend(["", "static unsigned _dtfuzz_mock_reset_count;"])
@@ -690,6 +810,9 @@ def summary(mocks: dict) -> list[dict]:
                 "source": symbol.get("source", "default"),
                 "reachable": symbol.get("reachable", True),
                 "scope": symbol.get("scope", "unknown"),
+                "must_link": bool(symbol.get("must_link")),
+                "external_source": bool(symbol.get("external_source")),
+                "reference_only": bool(symbol.get("reference_only")),
                 "questions": symbol.get("questions", []),
             }
         )

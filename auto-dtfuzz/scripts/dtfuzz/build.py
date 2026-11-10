@@ -213,6 +213,7 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
                         "signature": symbol.get("signature", ""),
                         "reachable": symbol.get("reachable", True),
                         "scope": symbol.get("scope", "unknown"),
+                        "must_link": bool(symbol.get("must_link")),
                     }
                 )
         log_text = f"$ {shlex.join(link_cmd)}\n{link.stderr}{link.stdout}"
@@ -220,6 +221,17 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
         write_text(build_log, existing + "\n\n" + log_text)
         write_text(workspace.build_dir / "build.sh", "#!/bin/sh\n" + "\n".join(shlex.join(cmd) for cmd in commands) + "\n")
         mocks = workspace.load_mocks(config)
+        must_link = [
+            {
+                "symbol": item.get("qualified_name") or item.get("name", ""),
+                "signature": item.get("signature", ""),
+                "status": item.get("status", ""),
+                "definition_files": item.get("definition_files", []),
+                "external_source": (item.get("external_source") or {}).get("file", ""),
+            }
+            for item in analysis.get("external_symbols", [])
+            if item.get("must_link")
+        ]
         pending = [
             {
                 "symbol": key,
@@ -231,6 +243,7 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
             if not symbol.get("confirmed", False)
             and symbol.get("stub", True)
             and symbol.get("reachable", True)
+            and not symbol.get("must_link")
         ]
         result = {
             "ok": False,
@@ -240,12 +253,20 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
             "commands": commands,
             "undefined_symbols": missing,
             "known_symbols": known,
+            "must_link": must_link,
             "pending_mocks": pending,
             "mocks_path": str(workspace.mocks_config_path(config)),
             "suggestion": (
-                "These symbols have no linked implementation. Ask the human for mock rules "
-                "(for example random fixed-length bytes or a 0/random-error return), import them "
-                "into the mocks config, then run gen/build. Do not link dt/ or other excluded fakes."
+                "These symbols have definitions in project/external code. Link them "
+                "(sources.real, resolve sources.exclude, or externals add --link); do not mock "
+                "them. Only symbols with no definition anywhere, or only in excluded dt/test "
+                "dirs, may be mocked."
+                if must_link
+                else (
+                    "These symbols have no linked implementation. Ask the human for mock rules "
+                    "(for example random fixed-length bytes or a 0/random-error return), import them "
+                    "into the mocks config, then run gen/build. Do not link dt/ or other excluded fakes."
+                )
             ),
         }
         write_json(workspace.build_dir / "build.json", result)
@@ -365,6 +386,8 @@ def probe(workspace, config: dict, analysis: dict) -> dict:
                     "status": symbol.get("status", "missing"),
                     "reachable": symbol.get("reachable", True),
                     "scope": symbol.get("scope", "unknown"),
+                    "must_link": bool(symbol.get("must_link")),
+                    "external_source": (symbol.get("external_source") or {}).get("file", ""),
                     "definition_files": symbol.get("definition_files", []),
                     "excluded_definition_files": symbol.get("excluded_definition_files", []),
                 }
@@ -408,6 +431,9 @@ def auto_stub_and_rebuild(workspace, config: dict, analysis: dict, mocks: dict, 
     for raw in missing:
         symbol = _find_symbol(analysis, raw)
         if not symbol:
+            continue
+        if symbol.get("must_link"):
+            # A real definition exists; --auto-stub must never override it.
             continue
         key = symbol.get("qualified_name") or symbol.get("name")
         if key in mocks.get("symbols", {}):

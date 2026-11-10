@@ -96,6 +96,35 @@ Use `--confirm-constraints` only when the file was already reviewed by a human.
 `mocks clear` preserves constraints because they describe the entry, not mock
 code.
 
+## Real definitions are never mockable
+
+For every function reachable from the entry (transitive callee closure from AST
++ function-pointer references + Fuzz Introspector), a definition in project
+code outside the excluded fake/test dirs — including a user-provided external
+component/SDK source directory — must be linked, not mocked.
+
+| Status | Mock allowed? | Action |
+| --- | --- | --- |
+| `missing` | yes | ask the human for a rule |
+| `excluded_only` (only in `dt/`, tests, mocks, stubs, fakes) | yes | ask the human; never copy the excluded body |
+| `conflict` (multiple allowed definitions) | **no** | choose a file via `sources.real` / `sources.exclude` |
+| `main_only` | **no** | add the allowed definition to `sources.real` |
+| `over_cap` | **no** | raise the scan cap / add the file to `sources.real` |
+| `external_definition` (provided external repo) | **no** | `externals add --link`, or `--reference-only` only if it is not production code |
+| `reference_only` external definition | yes, with explicit user exception | report it |
+
+The CLI enforces this:
+
+- `merge_defaults` does not create pending mocks for real definitions.
+- `enforce_real_definitions` disables existing/confirmed mocks
+  (`stub: false`, `status: must_link_real`).
+- `mocks set` / `mocks import` reject real-definition symbols.
+- `render_stubs` never emits them; the generated file lists them as blocked.
+- `build` fails with a `must_link` list and a linking suggestion.
+- `--auto-stub` skips them.
+- Macros/types with real definitions are used from the real headers; do not
+  redefine them in `custom_mocks.c` or the harness.
+
 ## Human rules
 
 `init` creates pending entries with signatures and call sites. Ask the user for

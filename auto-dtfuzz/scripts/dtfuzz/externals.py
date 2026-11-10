@@ -211,14 +211,17 @@ def scan_definitions(root: str | Path) -> dict[str, list[dict]]:
 
 def _external_entry(config: dict, path: str | Path, name: str = "", link: bool = False,
                     include_dirs: list[str] | None = None, defines: list[str] | None = None,
-                    std: str = "") -> dict:
+                    std: str = "", reference_only: bool = False) -> dict:
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise DtfuzzError(f"external source directory not found: {root}")
+    if link and reference_only:
+        raise DtfuzzError("--link and --reference-only are mutually exclusive")
     return {
         "name": name or root.name,
         "path": str(root),
         "link": bool(link),
+        "reference_only": bool(reference_only),
         "include_dirs": [str(Path(item).expanduser().resolve()) for item in (include_dirs or [])],
         "defines": list(defines or []),
         "std": std,
@@ -249,9 +252,9 @@ def _apply_include_dirs(config: dict, entry: dict) -> None:
 
 def add_source(config: dict, path: str | Path, name: str = "", link: bool = False,
                include_dirs: list[str] | None = None, defines: list[str] | None = None,
-               std: str = "") -> dict:
+               std: str = "", reference_only: bool = False) -> dict:
     entries = config.setdefault("external_sources", [])
-    entry = _external_entry(config, path, name, link, include_dirs, defines, std)
+    entry = _external_entry(config, path, name, link, include_dirs, defines, std, reference_only)
     for existing in entries:
         if existing.get("path") == entry["path"]:
             existing.update(entry)
@@ -460,12 +463,54 @@ def attach(analysis: dict, config: dict) -> dict:
             "",
         )
 
+    resolved = {
+        item.get("symbol", "")
+        for item in (analysis.get("probe") or {}).get("resolved", [])
+        if item.get("symbol")
+    }
+    reference_only = []
     for symbol in analysis.get("external_symbols", []):
+        names = {
+            symbol.get("name", ""),
+            symbol.get("qualified_name", ""),
+            symbol.get("mangled_name", ""),
+        }
+        if names & resolved:
+            symbol["status"] = "linked_real"
+            symbol["must_link"] = False
+            symbol.pop("must_link_source", None)
         definition = _pick_definition(index["functions"], symbol)
         if definition:
-            symbol["external_source"] = {**definition, "source_name": source_name(definition["file"])}
+            source_entry = next(
+                (entry for entry in entries if str(definition["file"]).startswith(entry.get("path", ""))),
+                {},
+            )
+            is_reference = bool(source_entry.get("reference_only"))
+            symbol["external_source"] = {
+                **definition,
+                "source_name": source_entry.get("name", source_name(definition["file"])),
+                "reference_only": is_reference,
+            }
+            symbol["reference_only"] = is_reference
+            if is_reference:
+                reference_only.append(symbol.get("qualified_name") or symbol.get("name", ""))
+            elif symbol.get("status") not in {"linked_real", "system"}:
+                # A real definition exists in the user-provided component repo:
+                # it must be linked, never mocked.
+                symbol["must_link"] = True
+                symbol["must_link_source"] = "external"
+                symbol["status"] = "external_definition"
         else:
             symbol.pop("external_source", None)
+            symbol.pop("reference_only", None)
+            if symbol.get("must_link_source") == "external":
+                symbol.pop("must_link", None)
+                symbol.pop("must_link_source", None)
+    if reference_only:
+        warnings.append(
+            "以下外部函数定义被用户标记为 reference-only（非生产实现），允许人工 mock，但报告中会注明："
+            + ", ".join(reference_only[:12])
+        )
 
     files = [path for path in _module_files(analysis) if path.is_file()]
     includes, used_macros = _collect_module_uses(files)
@@ -546,6 +591,8 @@ def attach(analysis: dict, config: dict) -> dict:
         "matched_macros": len(external_macros),
         "matched_types": len(external_types),
         "resolved_includes": len(external_includes),
+        "must_link": sum(1 for item in analysis.get("external_symbols", []) if item.get("must_link")),
+        "reference_only": sum(1 for item in analysis.get("external_symbols", []) if item.get("reference_only")),
         "questions": len(all_questions),
     }
     return analysis

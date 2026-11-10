@@ -771,6 +771,8 @@ def analyze_repo(
                 "is_method": bool(decl.get("is_method")),
                 "mangled_name": call.get("mangled_name") or decl.get("mangled_name", ""),
                 "status": status,
+                "must_link": status in {"conflict", "main_only", "over_cap"},
+                "must_link_source": "analysis" if status in {"conflict", "main_only", "over_cap"} else "",
                 "reachable": bool(call.get("reachable", True)),
                 "scope": call.get("scope", "unknown"),
             }
@@ -818,11 +820,37 @@ def analyze_repo(
             "按保守策略保留为待确认打桩候选："
             + ", ".join(item.get("name", "") for item in unknown_scope[:10])
         )
+    must_link = [
+        item
+        for item in external_symbols
+        if item.get("must_link") and item.get("reachable", True)
+    ]
+    if must_link:
+        warnings.append(
+            f"{len(must_link)} 个外部函数在非排除代码中有定义，必须链接而不是打桩："
+            + ", ".join(item.get("name", "") for item in must_link[:10])
+            + "。请调整 sources.real/sources.exclude，或提供外部源码并用 externals add --link。"
+        )
+        questions.append(
+            {
+                "id": "must_link",
+                "question": (
+                    f"{len(must_link)} 个函数在仓库或外部组件代码中有定义，不能打桩。"
+                    "请选择如何链接：加入 sources.real、调整排除目录，或提供外部组件源码并 --link。"
+                ),
+                "options": [
+                    "我把这些文件加入 sources.real",
+                    "我调整 sources.exclude_dirs / sources.exclude",
+                    "我提供外部组件源码目录并链接",
+                ],
+            }
+        )
     pending = [
         item
         for item in external_symbols
-        if item.get("status") in {"missing", "excluded_only", "conflict", "main_only", "over_cap"}
+        if item.get("status") in {"missing", "excluded_only"}
         and item.get("reachable", True)
+        and not item.get("must_link")
     ]
     if pending:
         questions.append(

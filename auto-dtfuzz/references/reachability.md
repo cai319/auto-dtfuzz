@@ -67,21 +67,41 @@ the pass is not available; use a pre-generated report or the light frontend.
 
 ### 3. Light frontend (no custom clang)
 
+One-time installation (or `dtfuzz setup --install --yes --components fi-light`):
+
 ```sh
-dtfuzz introspect --workdir WORK --run-light --fi-src /path/to/fuzz-introspector
+git clone --depth 1 https://github.com/ossf/fuzz-introspector \
+  ~/.local/share/fuzz-introspector
+python3 -m venv ~/.local/share/fuzz-introspector/.venv
+~/.local/share/fuzz-introspector/.venv/bin/pip install \
+  -r ~/.local/share/fuzz-introspector/requirements.txt
+```
+
+If `tree-sitter` fails to build:
+
+```sh
+sudo apt-get install -y build-essential python3-dev
+```
+
+Then run the light frontend with the venv interpreter:
+
+```sh
+dtfuzz introspect --workdir WORK --run-light \
+  --fi-src ~/.local/share/fuzz-introspector \
+  --fi-python ~/.local/share/fuzz-introspector/.venv/bin/python
 ```
 
 This runs:
 
 ```sh
-python3 <fi-src>/src/main.py full --target-dir <repo> --language c-cpp \
+<fi-python> <fi-src>/src/main.py full --target-dir <repo> --language c-cpp \
   --module-only --out-dir <workdir>/introspector/light --name dtfuzz
 ```
 
 It needs Fuzz Introspector's Python dependencies (`tree-sitter`, `pyyaml`, ...)
 in the selected interpreter. It does not need the LTO pass. The trade-off:
 `linkageType` is empty, so `dtfuzz` relies on the link probe for
-defined/undefined status.
+defined/undefined status. WSL2-specific steps are in `setup-wsl2.md`.
 
 ## Discovery
 

@@ -246,6 +246,30 @@ def generate_report(workspace, config: dict, analysis: dict, mocks: dict) -> str
             "建议生成 `.data.yaml` 后运行 `dtfuzz introspect --report <path>` 以收紧范围。"
         )
     lines.append("")
+    must_link = [item for item in analysis.get("external_symbols", []) if item.get("must_link")]
+    if must_link:
+        lines.extend(
+            [
+                "## 禁止打桩的真实定义",
+                "",
+                "> 以下函数在仓库非排除代码或用户提供的外部组件代码中有定义。必须链接真实实现，不能生成 mock；"
+                "如果当前构建仍报未定义符号，请调整 sources.real / sources.exclude 或 `externals add --link`。",
+                "",
+                _table(
+                    ["符号", "状态", "定义位置"],
+                    [
+                        [
+                            item.get("qualified_name") or item.get("name", ""),
+                            item.get("status", ""),
+                            (item.get("external_source") or {}).get("file")
+                            or ", ".join(item.get("definition_files", [])[:3]),
+                        ]
+                        for item in must_link[:40]
+                    ],
+                ),
+                "",
+            ]
+        )
     external_sources = analysis.get("external_sources") or []
     lines.extend(["## 外部源码/宏/类型（用户提供的外挂目录）", ""])
     if external_sources:

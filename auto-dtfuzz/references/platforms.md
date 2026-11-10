@@ -5,6 +5,15 @@ cross-compiler: an ARM/embedded binary cannot be fuzzed on the host without an
 emulator. Run dtfuzz inside WSL/Linux for Linux targets; macOS is suitable for
 portable modules and local smoke tests.
 
+## Windows + WSL2
+
+Native Windows is not supported. Install WSL2 Ubuntu, run everything (including
+Claude Code) inside WSL, and keep repositories under `~/src`, not `/mnt/c`.
+Use `dtfuzz setup --json` for a platform-specific plan and
+`dtfuzz setup --install --yes --components base,fi-light` only after reviewing
+it. The full step-by-step guide, Fuzz Introspector options, and troubleshooting
+are in `setup-wsl2.md`.
+
 ## macOS
 
 Apple Command Line Tools clang does not ship the libFuzzer runtime

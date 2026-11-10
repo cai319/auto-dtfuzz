@@ -55,6 +55,30 @@ libFuzzer are usable; `coverage_ok` means source coverage tools are present.
 `ok` requires both. libFuzzer `cov`/`ft`/`corp` feedback works with `fuzz_ok`
 alone; source-coverage tables and `optimize` need `coverage_ok`.
 
+### setup
+
+```sh
+dtfuzz setup --json [--components base,fi-light,fi-lto,docker] [--fi-src PATH] [--repo PATH]
+dtfuzz setup --install --yes --components base,fi-light
+```
+
+Platform-aware setup planner. Default is **plan only**: it reports the detected
+OS/WSL/distro, missing tools, and the exact install commands. `--install`
+requires `--yes`; `sudo` commands run only when `sudo -n true` succeeds,
+otherwise the commands are printed for manual execution.
+
+Components:
+
+- `base` — clang/libFuzzer, llvm-cov/profdata, lld, binutils, git, Python venv.
+- `fi-light` — clone fuzz-introspector, create a venv, `pip install -r
+  requirements.txt`; use with `introspect --run-light --fi-src ... --fi-python
+  <venv>/bin/python`.
+- `fi-lto` — optional, heavy: builds a custom LLVM/Clang with the Fuzz
+  Introspector pass (Linux + gold).
+- `docker` — optional: Docker/OSS-Fuzz helper for generating reports.
+
+Windows is supported only through WSL2. See `references/setup-wsl2.md`.
+
 ### init
 
 ```sh
@@ -137,7 +161,7 @@ unreachable pending mocks are pruned), re-runs the link probe, and refreshes
 
 ```sh
 dtfuzz introspect --workdir DIR [--report PATH] [--json]
-dtfuzz introspect --workdir DIR --run-light --fi-src PATH [--json]
+dtfuzz introspect --workdir DIR --run-light --fi-src PATH [--fi-python PATH] [--json]
 dtfuzz introspect --workdir DIR --run-lto --fi-clang PATH [--fi-src PATH] [--json]
 ```
 
@@ -205,10 +229,15 @@ dtfuzz mocks import --workdir DIR --file patches.json --json
 dtfuzz mocks clear --workdir DIR --json
 ```
 
-`mocks list` shows `confirmed`, `status`, `reachable`, `scope`, `return`,
-`return_sequence`, `out_params`, `source`, the mocks path, and any constraints
-with `[REVIEW]` / `[OK]` markers. Pending entries are not generated;
-unreachable pending entries are pruned during analysis.
+`mocks list` shows `confirmed`, `status`, `reachable`, `scope`, `must_link`,
+`return`, `return_sequence`, `out_params`, `source`, the mocks path, and any
+constraints with `[REVIEW]` / `[OK]` markers. Pending entries are not generated;
+unreachable pending entries are pruned during analysis. Symbols with a real
+definition are reported under `must_link` and are never emitted.
+
+`mocks set` / `mocks import` refuse symbols with a real definition (repo
+non-excluded code or a non-reference external component repo). Link the
+implementation instead; only `missing` or `excluded_only` symbols are mockable.
 
 `mocks set` sets `confirmed: true`. `mocks import` accepts either
 `{"symbols": {...}}` or a flat symbol map; imported entries are marked
@@ -264,7 +293,7 @@ preserves constraints.
 ### externals
 
 ```sh
-dtfuzz externals add --workdir DIR --path DIR [--name NAME] [--link] \
+dtfuzz externals add --workdir DIR --path DIR [--name NAME] [--link|--reference-only] \
   [--include-dir DIR]... [--define NAME=VALUE]... [--std STD] --json
 dtfuzz externals list   --workdir DIR --json
 dtfuzz externals remove --workdir DIR --path DIR [--keep-linked] --json
@@ -279,11 +308,16 @@ typedef/struct/enum types, and module `#include`s. Results are attached to
 `report.md`. `init`, `mocks list`, `probe`, and `externals inquire` expose
 `external_source_questions` for symbols/headers still missing source.
 
-`--link` treats the directory as production code: adds its `.c/.cc` files to
-`sources.real` and its include dirs/defines to the build config, then re-runs
-analysis/probe. Use it only with explicit user approval; the default is
-context-only. `externals remove` unlinks by default; `--keep-linked` keeps the
-files in `sources.real`.
+A matched reachable function definition is a **real definition**: it is marked
+`must_link`, no mock is created/kept, and `build` fails until it is linked.
+`--link` adds the directory's `.c/.cc` files to `sources.real` and its include
+dirs/defines to the build config, then re-runs analysis/probe. Use it with
+explicit user approval when the directory is the production implementation.
+
+`--reference-only` is the explicit exception for a non-production reference
+copy; only then are mocks allowed for symbols defined there. It cannot be
+combined with `--link`. `externals remove` unlinks by default; `--keep-linked`
+keeps the files in `sources.real`.
 
 ### gen
 
@@ -470,6 +504,7 @@ dtfuzz clean --workdir DIR [--all|--build|--coverage|--corpus|--artifacts] --jso
       "name": "secure-c",
       "path": "/opt/secure-c",
       "link": false,
+      "reference_only": false,
       "include_dirs": ["/opt/secure-c/include"],
       "defines": [],
       "std": "",
@@ -504,9 +539,10 @@ auto-discover. `auto` is the discovery switch used by `init`/`analyze`.
 `fi_clang`/`fi_src`/`python` are used by `introspect --run-lto` /
 `--run-light`. See `references/reachability.md`.
 
-`external_sources` is the user-provided mounted library/SDK registry. The
-default `link: false` means read-only context for mock/constraint analysis.
-`--link` adds the source files and include dirs to the normal build config. See
+`external_sources` is the user-provided mounted library/SDK registry. Scanning
+is read-only, but a matched definition is treated as real: `must_link` blocks
+mocking until the source is linked (`--link`) or explicitly marked
+`reference_only: true` as a non-production reference. See
 `references/external-sources.md`.
 
 `input_model`: `buffer` (whole input is the buffer), `typed_buffer` (first

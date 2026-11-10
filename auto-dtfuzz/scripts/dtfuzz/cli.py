@@ -12,6 +12,7 @@ from . import coverage as coverage_mod
 from . import externals as externals_mod
 from . import introspect as introspect_mod
 from . import optimize as optimize_mod
+from . import setup as setup_mod
 from .analyze import analyze_repo
 from .build import auto_stub_and_rebuild, build, probe, resolve_sources
 from .campaign import campaign as run_campaign
@@ -22,6 +23,8 @@ from .mocks import (
     constraint_summary,
     constraints_prompt_section,
     default_constraints,
+    enforce_real_definitions,
+    matching_real_definition,
     merge_constraints,
     merge_defaults,
     questions as mock_questions,
@@ -114,6 +117,36 @@ def cmd_doctor(args) -> dict:
     )
     _emit(args, {"ok": info.get("ok", False), **info}, text)
     return info
+
+
+def cmd_setup(args) -> dict:
+    components: list[str] = []
+    for item in args.components or []:
+        components.extend(part.strip() for part in item.split(",") if part.strip())
+    plan = setup_mod.build_plan(
+        components or None,
+        fi_src=args.fi_src or setup_mod.DEFAULT_FI_SRC,
+        repo=args.repo,
+    )
+    if not args.install:
+        data = {"ok": True, **plan}
+        _emit(args, data, setup_mod.format_plan(plan))
+        return data
+    result = setup_mod.install(plan, yes=args.yes)
+    data = {"ok": bool(result.get("ok")), "plan": plan, **result}
+    if result.get("manual"):
+        text = "sudo needs a password; run these commands manually:\n" + "\n".join(
+            f"  {item}" for item in result["manual"]
+        )
+    elif result.get("ok"):
+        text = "installed:\n" + "\n".join(f"  {item['command']}" for item in result.get("executed", []))
+    else:
+        failed = result.get("failed", {})
+        text = f"install failed: {failed.get('command')}\n{(failed.get('stderr_tail') or '')[-2000:]}"
+    _emit(args, data, text)
+    if not result.get("ok"):
+        raise SystemExit(1)
+    return data
 
 
 def _entry_from_analysis(analysis: dict) -> dict:
@@ -267,9 +300,13 @@ def cmd_init(args) -> dict:
         "llvm_cxxfilt": toolchain.get("llvm_cxxfilt") or "",
     }
     ws.save_config(config)
+    # A real definition in a user-provided component repo must be linked, not
+    # mocked.  Scan before mock candidates are created.
+    externals_mod.attach(analysis, config)
     mocks_path = ws.mocks_config_path(config)
     existing_mocks = ws.load_mocks(config) if mocks_path.is_file() else None
     mocks = merge_defaults(analysis, existing_mocks)
+    blocked = enforce_real_definitions(mocks, analysis)
     ws.save_mocks(mocks, config)
     probe_result = probe(ws, config, analysis)
     if probe_result.get("ok"):
@@ -295,6 +332,10 @@ def cmd_init(args) -> dict:
         analysis["probe"] = {"error": probe_result.get("log", "probe failed")}
         analysis.setdefault("warnings", []).append("链接探测失败；mock 候选基于全仓定义扫描，需在构建时复核。")
     externals_mod.attach(analysis, config)
+    blocked += enforce_real_definitions(mocks, analysis)
+    if blocked:
+        ws.save_mocks(mocks, config)
+    analysis["blocked_mocks"] = sorted(set(blocked))
     write_json(ws.analysis_path, analysis)
     questions = mock_questions(mocks)
     data = {
@@ -321,6 +362,17 @@ def cmd_init(args) -> dict:
         "reachability": analysis.get("reachability"),
         "external_source_summary": analysis.get("external_source_summary", {}),
         "external_source_questions": analysis.get("external_source_questions", []),
+        "must_link": [
+            {
+                "symbol": item.get("qualified_name") or item.get("name"),
+                "status": item.get("status"),
+                "definition_files": item.get("definition_files", []),
+                "external_source": (item.get("external_source") or {}).get("file", ""),
+            }
+            for item in analysis.get("external_symbols", [])
+            if item.get("must_link")
+        ],
+        "blocked_mocks": analysis.get("blocked_mocks", []),
         "mock_questions": questions,
         "analysis_questions": analysis.get("questions", []),
         "warnings": analysis.get("warnings", []),
@@ -369,11 +421,23 @@ def cmd_init(args) -> dict:
                 text_lines.append(f"  header {item.get('header')} (used by {item.get('file')})")
             else:
                 text_lines.append(f"  {item.get('symbol')}: {item.get('signature', '')}")
+    must_link = [item for item in analysis.get("external_symbols", []) if item.get("must_link")]
+    if must_link:
+        text_lines.append("must link (real definition exists; never mock):")
+        for item in must_link[:20]:
+            definition = (item.get("external_source") or {}).get("file") or ", ".join(item.get("definition_files", [])[:2])
+            text_lines.append(
+                f"  {item.get('qualified_name') or item.get('name')} [{item.get('status')}] {definition}"
+            )
     text_lines.append(f"mocks config: {mocks_path}")
     text_lines.append("pending mocks (no linked implementation; human rules required):")
     for item in sorted((mocks.get("symbols") or {}).items()):
         key, symbol = item
-        if not symbol.get("confirmed", False) and symbol.get("reachable", True):
+        if (
+            not symbol.get("confirmed", False)
+            and symbol.get("reachable", True)
+            and not symbol.get("must_link")
+        ):
             text_lines.append(
                 f"  {key}: {symbol.get('signature', '')} "
                 f"[{symbol.get('status', 'pending')}; scope={symbol.get('scope', 'unknown')}]"
@@ -414,6 +478,9 @@ def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, ex
         introspect_mod.attach(analysis, reachability, config["repo"])
         analysis.setdefault("warnings", []).extend(reachability.get("warnings", []))
         introspect_mod.write_reachability(ws, reachability)
+    # Scan user-provided external component repos before creating mocks: a
+    # reachable symbol with a real definition there must be linked, not stubbed.
+    externals_mod.attach(analysis, config)
     config["entry"] = _entry_from_analysis(analysis)
     config["sources"]["target"] = analysis.get("module_files", analysis.get("internal_files", []))
     existing_real = list(config.get("sources", {}).get("real") or [])
@@ -423,6 +490,7 @@ def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, ex
     config["coverage"]["target_files"] = analysis.get("target_files", [])
     ws.save_config(config)
     mocks = merge_defaults(analysis, ws.load_mocks(config))
+    blocked = enforce_real_definitions(mocks, analysis)
     ws.save_mocks(mocks, config)
     probe_result = probe(ws, config, analysis)
     if probe_result.get("ok"):
@@ -447,6 +515,10 @@ def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, ex
     else:
         analysis["probe"] = {"error": probe_result.get("log", "probe failed")}
     externals_mod.attach(analysis, config)
+    blocked += enforce_real_definitions(mocks, analysis)
+    if blocked:
+        ws.save_mocks(mocks, config)
+    analysis["blocked_mocks"] = sorted(set(blocked))
     write_json(ws.analysis_path, analysis)
     return analysis, mocks, probe_result
 
@@ -473,7 +545,18 @@ def cmd_analyze(args) -> dict:
         "pending_mocks": [
             {"symbol": key, "signature": symbol.get("signature", ""), "reachable": symbol.get("reachable", True)}
             for key, symbol in sorted((mocks.get("symbols") or {}).items())
-            if not symbol.get("confirmed", False) and symbol.get("reachable", True)
+            if not symbol.get("confirmed", False)
+            and symbol.get("reachable", True)
+            and not symbol.get("must_link")
+        ],
+        "must_link": [
+            {
+                "symbol": item.get("qualified_name") or item.get("name"),
+                "status": item.get("status"),
+                "external_source": (item.get("external_source") or {}).get("file", ""),
+            }
+            for item in analysis.get("external_symbols", [])
+            if item.get("must_link")
         ],
         "warnings": analysis.get("warnings", []),
         "mock_questions": mock_questions(mocks),
@@ -492,7 +575,7 @@ def cmd_introspect(args) -> dict:
         fi_src = args.fi_src or (config.get("introspector", {}) or {}).get("fi_src") or os.environ.get("FI_SRC")
         if not fi_src:
             raise DtfuzzError("--run-light requires --fi-src or config.introspector.fi_src (or FI_SRC)")
-        python = (config.get("introspector", {}) or {}).get("python") or "python3"
+        python = args.fi_python or (config.get("introspector", {}) or {}).get("python") or "python3"
         report_path = introspect_mod.run_light(repo, ws.introspector_dir / "light", fi_src, python)
         run_info["run"] = "light"
     elif args.run_lto:
@@ -506,7 +589,7 @@ def cmd_introspect(args) -> dict:
         if harness is None:
             raise DtfuzzError("harness missing; run `dtfuzz gen` before `dtfuzz introspect --run-lto`")
         fi_src = args.fi_src or (config.get("introspector", {}) or {}).get("fi_src") or os.environ.get("FI_SRC")
-        python = (config.get("introspector", {}) or {}).get("python") or "python3"
+        python = args.fi_python or (config.get("introspector", {}) or {}).get("python") or "python3"
         report_path = introspect_mod.run_lto(
             repo,
             ws.introspector_dir / "lto",
@@ -660,6 +743,7 @@ def cmd_externals_add(args) -> dict:
         include_dirs=list(args.include_dir or []),
         defines=list(args.define or []),
         std=args.std or "",
+        reference_only=bool(getattr(args, "reference_only", False)),
     )
     ws.save_config(config)
     if args.link:
@@ -667,11 +751,19 @@ def cmd_externals_add(args) -> dict:
         analysis, _, _ = _reanalyze(ws, config, reachability)
     else:
         _external_attach(ws, config, analysis)
+        mocks = ws.load_mocks(config)
+        if enforce_real_definitions(mocks, analysis):
+            ws.save_mocks(mocks, config)
     data = {
         "ok": True,
         "source": entry,
         "external_source_summary": analysis.get("external_source_summary", {}),
         "external_source_questions": analysis.get("external_source_questions", []),
+        "must_link": [
+            item.get("qualified_name") or item.get("name")
+            for item in analysis.get("external_symbols", [])
+            if item.get("must_link")
+        ],
         "warnings": analysis.get("warnings", []),
     }
     text_lines = [
@@ -682,6 +774,8 @@ def cmd_externals_add(args) -> dict:
         text_lines.append("questions:")
         for item in data["external_source_questions"][:20]:
             text_lines.append(f"  {item.get('symbol') or item.get('header')}: {item.get('question', '')}")
+    if data["must_link"]:
+        text_lines.append("must link (real definition exists; never mock): " + ", ".join(data["must_link"]))
     _emit(args, data, "\n".join(text_lines))
     return data
 
@@ -730,6 +824,9 @@ def cmd_externals_remove(args) -> dict:
         analysis, _, _ = _reanalyze(ws, config, reachability)
     else:
         _external_attach(ws, config, analysis)
+        mocks = ws.load_mocks(config)
+        if enforce_real_definitions(mocks, analysis):
+            ws.save_mocks(mocks, config)
     data = {"ok": removed, "removed": removed, "external_sources": config.get("external_sources", [])}
     _emit(args, data, f"removed {args.path}" if removed else f"not registered: {args.path}")
     return data
@@ -738,6 +835,9 @@ def cmd_externals_remove(args) -> dict:
 def cmd_externals_scan(args) -> dict:
     ws, config, analysis = _load(args)
     _external_attach(ws, config, analysis)
+    mocks = ws.load_mocks(config)
+    if enforce_real_definitions(mocks, analysis):
+        ws.save_mocks(mocks, config)
     data = {
         "ok": True,
         "external_source_summary": analysis.get("external_source_summary", {}),
@@ -771,8 +871,13 @@ def cmd_probe(args) -> dict:
         "ok": result.get("ok", False),
     }
     externals_mod.attach(analysis, config)
+    mocks = ws.load_mocks(config)
+    blocked = enforce_real_definitions(mocks, analysis)
+    if blocked:
+        ws.save_mocks(mocks, config)
+    analysis["blocked_mocks"] = sorted(set(blocked))
     write_json(ws.analysis_path, analysis)
-    data = {"ok": bool(result.get("ok")), **result}
+    data = {"ok": bool(result.get("ok")), **result, "blocked_mocks": sorted(set(blocked))}
     if result.get("ok"):
         text = (
             f"resolved: {len(result.get('resolved', []))}\n"
@@ -827,6 +932,16 @@ def cmd_mocks_list(args) -> dict:
         "external_sources": config.get("external_sources", []),
         "external_source_summary": analysis.get("external_source_summary", {}),
         "external_source_questions": analysis.get("external_source_questions", []),
+        "must_link": [
+            {
+                "symbol": item.get("qualified_name") or item.get("name"),
+                "status": item.get("status"),
+                "definition_files": item.get("definition_files", []),
+                "external_source": (item.get("external_source") or {}).get("file", ""),
+            }
+            for item in analysis.get("external_symbols", [])
+            if item.get("must_link")
+        ],
         "variables": mocks.get("variables", {}),
     }
     lines = []
@@ -834,9 +949,15 @@ def cmd_mocks_list(args) -> dict:
         lines.append(
             f"{item['symbol']}: confirmed={item['confirmed']} status={item['status']} "
             f"reachable={item.get('reachable', True)} scope={item.get('scope', 'unknown')} "
+            f"must_link={item.get('must_link', False)} "
             f"return={item['return']!r} sequence={item['return_sequence']} out={item['out_params']} "
             f"source={item['source']} stub={item['stub']}"
         )
+    if data["must_link"]:
+        lines.append("must link (real definition exists; never mock):")
+        for item in data["must_link"][:20]:
+            definition = item.get("external_source") or ", ".join(item.get("definition_files", [])[:2])
+            lines.append(f"  {item['symbol']} [{item['status']}] {definition}")
     if data["constraints"]:
         lines.append("constraints:")
         for item in data["constraints"]:
@@ -859,6 +980,13 @@ def cmd_mocks_set(args) -> dict:
     ws = _workspace(args)
     config = ws.load_config()
     mocks = ws.load_mocks(config)
+    analysis = read_json(ws.analysis_path, default={}) or {}
+    real = matching_real_definition(args.symbol, analysis)
+    if real:
+        raise DtfuzzError(
+            f"{args.symbol} has a real definition ({real.get('status')}); link it instead of mocking it. "
+            "Only symbols with no definition, or definitions solely in excluded dt/test dirs, may be mocked."
+        )
     patch: dict = {}
     if args.return_value is not None:
         patch["return"] = args.return_value
@@ -919,7 +1047,9 @@ def cmd_mocks_import(args) -> dict:
     if incoming is None:
         raise DtfuzzError(f"file not found: {args.file}")
     mocks = ws.load_mocks(config)
+    analysis = read_json(ws.analysis_path, default={}) or {}
     imported = []
+    blocked = []
     if "symbols" in incoming:
         items = incoming["symbols"].items()
     else:
@@ -929,6 +1059,10 @@ def cmd_mocks_import(args) -> dict:
             if key not in {"variables", "version", "constraints"}
         )
     for key, value in items:
+        real = matching_real_definition(key.split("@", 1)[0], analysis)
+        if real:
+            blocked.append(key)
+            continue
         existing = mocks.get("symbols", {}).get(key, {})
         merged = deep_merge(existing, {k: v for k, v in value.items() if k != "out_params"})
         if "out_params" in value and isinstance(value["out_params"], dict):
@@ -950,10 +1084,14 @@ def cmd_mocks_import(args) -> dict:
         "ok": True,
         "symbols": len(mocks.get("symbols", {})),
         "imported": imported,
+        "blocked_real_definitions": blocked,
         "constraints_added": constraints_added,
         "mocks_path": str(ws.mocks_config_path(config)),
     }
-    _emit(args, data, f"imported {len(imported)} symbols into {ws.mocks_config_path(config)}")
+    text = f"imported {len(imported)} symbols into {ws.mocks_config_path(config)}"
+    if blocked:
+        text += "\nblocked (real definitions exist; link, do not mock): " + ", ".join(blocked)
+    _emit(args, data, text)
     return data
 
 
@@ -981,6 +1119,8 @@ def cmd_gen(args) -> dict:
 def cmd_build(args) -> dict:
     ws, config, analysis = _load(args)
     mocks = ws.load_mocks(config)
+    if enforce_real_definitions(mocks, analysis):
+        ws.save_mocks(mocks, config)
     result = build(ws, config, analysis)
     if not result.get("ok") and args.auto_stub:
         result = auto_stub_and_rebuild(ws, config, analysis, mocks, result)
@@ -991,7 +1131,11 @@ def cmd_build(args) -> dict:
         text = f"build failed at {result.get('stage')}: {result.get('log')}"
         if result.get("undefined_symbols"):
             text += "\nundefined: " + ", ".join(result["undefined_symbols"])
-            text += "\n" + result.get("suggestion", "")
+        if result.get("must_link"):
+            text += "\nmust link (never mock): " + ", ".join(
+                item.get("symbol", "") for item in result["must_link"]
+            )
+        text += "\n" + result.get("suggestion", "")
     _emit(args, data, text)
     if not result.get("ok"):
         raise SystemExit(1)
@@ -1187,6 +1331,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_json(p)
     p.set_defaults(func=cmd_doctor)
 
+    p = sub.add_parser("setup", help="plan or install platform toolchains (WSL2-aware)")
+    p.add_argument("--components", action="append", help="base, fi-light, fi-lto, docker (repeatable or comma-separated)")
+    p.add_argument("--fi-src", help="Fuzz Introspector checkout path")
+    p.add_argument("--repo", help="optional repo path for doctor/path warnings")
+    p.add_argument("--install", action="store_true", help="execute the plan (requires --yes)")
+    p.add_argument("--yes", action="store_true", help="confirm installation")
+    add_json(p)
+    p.set_defaults(func=cmd_setup)
+
     p = sub.add_parser("init", help="analyze a module and create a workspace")
     p.add_argument("--repo")
     p.add_argument("--module")
@@ -1224,6 +1377,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-lto", action="store_true", help="compile with the Fuzz Introspector LTO pass (needs --fi-clang)")
     p.add_argument("--fi-clang", help="clang built with the Fuzz Introspector LLVM pass")
     p.add_argument("--fi-src", help="path to the fuzz-introspector checkout")
+    p.add_argument("--fi-python", help="python interpreter for the fuzz-introspector light frontend (e.g. its venv)")
     add_json(p)
     p.set_defaults(func=cmd_introspect)
 
@@ -1316,6 +1470,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--path", required=True)
     e.add_argument("--name")
     e.add_argument("--link", action="store_true", help="treat the source as production code and add it to sources.real")
+    e.add_argument(
+        "--reference-only",
+        action="store_true",
+        help="explicitly mark this directory as non-production reference; mocks remain allowed",
+    )
     e.add_argument("--include-dir", action="append")
     e.add_argument("--define", action="append")
     e.add_argument("--std")

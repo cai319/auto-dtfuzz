@@ -80,7 +80,7 @@ sizes.
 - Missing non-system headers become `kind: include` questions.
 - System headers (`stdio.h`, `sys/socket.h`, ...) are ignored.
 
-## Context-only by default
+## Definitions are real by default
 
 Registered sources live in `config.json`:
 
@@ -91,6 +91,7 @@ Registered sources live in `config.json`:
       "name": "secure-c",
       "path": "/opt/secure-c",
       "link": false,
+      "reference_only": false,
       "include_dirs": ["/opt/secure-c/include"],
       "defines": ["SECURE_API=1"],
       "std": "c11",
@@ -100,7 +101,39 @@ Registered sources live in `config.json`:
 }
 ```
 
-They are scanned and shown in prompts/reports, but not compiled.
+Scanning is read-only, but a **reachable function definition found in the
+directory is treated as a real definition**:
+
+- the symbol is marked `must_link: true`, `status: external_definition`;
+- `merge_defaults` never creates a pending mock for it;
+- any existing/confirmed mock is disabled (`stub: false`,
+  `status: must_link_real`);
+- `gen` never emits a stub for it;
+- `build` fails with a `must_link` list and a suggestion to link it.
+
+To satisfy it, link the directory:
+
+```sh
+dtfuzz externals add --workdir WORK --path /path/to/library --link ...
+dtfuzz probe --workdir WORK --json
+```
+
+The sources are added to `sources.real`; resolved symbols become
+`linked_real` and no mock is needed.
+
+### Reference-only exception
+
+If the directory is **not** the production implementation (just a reference copy
+from a different version/platform), the user can explicitly mark it:
+
+```sh
+dtfuzz externals add --workdir WORK --path /path/to/reference \
+  --reference-only ...
+```
+
+Only then are mocks allowed for those symbols; the report records
+`reference_only: true`. Do not select this exception without the user's explicit
+statement. `--link` and `--reference-only` are mutually exclusive.
 
 ### Explicit linking
 

@@ -695,13 +695,16 @@ def filter_analysis(analysis: dict, reachability: dict | None) -> dict:
     """Annotate external symbols with reachability and drop unreachable mocks."""
     if not reachability or not reachability.get("matched"):
         return analysis
-    pending_statuses = {"missing", "excluded_only", "conflict", "main_only", "over_cap"}
+    pending_statuses = {"missing", "excluded_only"}
     for symbol in analysis.get("external_symbols", []):
         names = {symbol.get("name", ""), symbol.get("qualified_name", ""), symbol.get("mangled_name", "")}
         states = [name_state(name, reachability) for name in names if name]
         if "reachable" in states:
             reachable = True
-            scope = "stub_scope" if symbol.get("status") in pending_statuses else "reachable"
+            if symbol.get("must_link"):
+                scope = "must_link"
+            else:
+                scope = "stub_scope" if symbol.get("status") in pending_statuses else "reachable"
         elif states and all(state == "unreachable" for state in states):
             reachable = False
             scope = "unreachable"
@@ -715,7 +718,9 @@ def filter_analysis(analysis: dict, reachability: dict | None) -> dict:
     pending = [
         item
         for item in analysis.get("external_symbols", [])
-        if item.get("reachable", True) and item.get("status") in pending_statuses
+        if item.get("reachable", True)
+        and item.get("status") in pending_statuses
+        and not item.get("must_link")
     ]
     analysis["pending_mock_count"] = len(pending)
     return analysis

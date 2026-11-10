@@ -33,6 +33,18 @@ libFuzzer runtime and a matching `llvm-cov` / `llvm-profdata`.
 
 - **Never claim coverage without reading `coverage/summary.json`** (or the
   `coverage` object from `round`). Report covered/total and percent.
+- **A real definition is never mockable.** Walk the transitive callee closure
+  from the entry (AST call graph + function-pointer references + Fuzz
+  Introspector `functionsReached`). For every reachable function, if a
+  definition exists in project code outside the excluded fake/test dirs —
+  including a user-provided external component/SDK source directory — link that
+  implementation and never create, confirm, import, or generate a mock for it.
+  `conflict`, `main_only`, `over_cap`, and `external_definition` are
+  must-link states, not mock states. Only two cases may be mocked: no definition
+  anywhere (`missing`), or definitions solely in excluded fake/test dirs
+  (`excluded_only`). Macros/types with real definitions must be included from
+  the real headers, never redefined in mocks or the harness. The only external
+  source exception is an explicit user `--reference-only` marker; report it.
 - **Link real implementations first.** Scan the whole repo for definitions
   (cross-module is expected) and link them. Only functions with no allowed
   implementation are mock candidates.
@@ -57,12 +69,15 @@ libFuzzer runtime and a matching `llvm-cov` / `llvm-profdata`.
   `review.highlight: true`. Show the `[REVIEW]` items to the human, then
   `dtfuzz constraints confirm --id ...` or `reject`. Never confirm constraints
   or translate `setup_teardown` into harness code without the human's decision.
-- **External source directories are read-only by default.** When
+- **External source definitions are real definitions.** When
   `external_source_questions` is non-empty, ask the user for a mounted
-  library/SDK source directory before inventing mock semantics. Never link or
-  execute that code with `--link` unless the user explicitly says it is the
-  production implementation. Scanning functions/macros/types is context, not
-  permission to link.
+  library/SDK source directory before inventing mock semantics. Registering a
+  directory scans it read-only, but if a reachable symbol has a definition
+  there and the directory is not explicitly marked `--reference-only`, the CLI
+  treats it as must-link: no mock is created or kept, and the build fails until
+  the source is linked (`--link`) or the user says it is not the production
+  implementation and marks it reference-only. Never use `--reference-only`
+  yourself.
 - **Do not modify the target repository's source.** Workspace files live in
   `<repo>/.dtfuzz/<module>/`; mocks live in a separate human-maintainable
   `<repo>/fuzz_mocks/<module>/`. Report findings instead of patching target code.
@@ -93,6 +108,19 @@ commands you intend to parse.
 discovery and corpus growth still work without the source-coverage tools.
 `init`/`build`/`round` require `fuzz_ok`; `optimize` and the source-coverage
 tables require `coverage_ok`.
+
+For a platform-aware install plan (Windows/WSL2 included), use:
+
+```sh
+"$DTFUZZ" setup --json
+# plan only; execute only with explicit confirmation:
+"$DTFUZZ" setup --install --yes --components base,fi-light
+```
+
+`setup` never installs silently. It prints commands, requires `--install --yes`,
+and refuses to run `sudo` unless passwordless sudo works; otherwise it prints the
+manual commands. On Windows, run everything inside WSL2 (Ubuntu), not native
+Windows. Full guide: `references/setup-wsl2.md`.
 
 `ok: false` means the toolchain is incomplete. If `fuzz_ok` is false, stop and
 give the install hint instead of attempting a build:
@@ -189,9 +217,12 @@ Ways to get a report, in order of preference:
    `fuzzerLogFile-*.data.yaml`.
 2. **LTO pass**: `dtfuzz introspect --workdir "$WORK" --run-lto --fi-clang
    /path/to/clang [--fi-src ...]`. Needs Linux + gold; unavailable on macOS.
-3. **Light frontend**: `dtfuzz introspect --workdir "$WORK" --run-light
-   --fi-src /path/to/fuzz-introspector`. No custom clang, but `linkageType` is
-   empty and the link probe decides defined/undefined.
+3. **Light frontend**: install once with
+   `dtfuzz setup --install --yes --components fi-light` (clone + venv + pip),
+   then `dtfuzz introspect --workdir "$WORK" --run-light
+   --fi-src ~/.local/share/fuzz-introspector --fi-python
+   ~/.local/share/fuzz-introspector/.venv/bin/python`. No custom clang, but
+   `linkageType` is empty and the link probe decides defined/undefined.
 
 Read `module_count` (reachable in-module), `external_count` (reachable outside),
 and `stub_scope` (external reachable joined with the link probe). A
@@ -409,19 +440,22 @@ The scan returns `matched_functions` (file/line/snippet),
 `matched_macros`/`matched_types` for names the module actually uses,
 `external_includes`, and remaining `external_source_questions`. Use the
 snippets in `optimize` and `constraints draft` prompts, and cite the file:line
-when proposing mock rules or input constraints. The scan is
-**read-only**: nothing is executed and nothing is linked unless the user
-explicitly says the source is production code and asks for linking:
+when proposing mock rules or input constraints.
+
+A matched function definition is treated as a **real definition**: the CLI sets
+`must_link` and refuses to create or keep a mock for it. If the user says the
+directory is the production implementation, link it:
 
 ```sh
 "$DTFUZZ" externals add --workdir "$WORK" --path /path/to/library --link ...
 "$DTFUZZ" probe --workdir "$WORK" --json
 ```
 
-Never pass `--link` on your own; an external directory is context by default.
-If the user says the external implementation is the real one, link it, re-probe,
-and let `mocks` disable symbols that are now resolved. See
-`references/external-sources.md`.
+If (and only if) the user says the directory is **not** the production
+implementation and is provided for reference only, re-register it with
+`--reference-only`; only then may mocks remain. Never choose that exception on
+your own. Scanning itself never executes code, and linking only happens through
+`--link`. See `references/external-sources.md`.
 
 ## 4. Build
 
@@ -432,8 +466,9 @@ and let `mocks` disable symbols that are now resolved. See
 If it fails:
 
 1. Read `build/build.log`.
-2. `build.json` lists `undefined_symbols`, `known_symbols`, and
-   `pending_mocks`.
+2. `build.json` lists `undefined_symbols`, `known_symbols`, `must_link`, and
+   `pending_mocks`. `must_link` symbols have real definitions and must be
+   linked (sources.real / externals --link); they are not mock candidates.
 3. Fix include dirs / defines:
    `config set --patch-json '{"sources":{"include_dirs":[...],"defines":[...]}}'`.
 4. If a dependency should be real code, add it to `sources.real` and make sure
@@ -607,4 +642,6 @@ unreachable lines, fixed mock behavior) rather than implying success.
 - `references/bug-finding.md` — fork-mode discovery, ASan bug classes, the
   bug-zoo validation, and how to separate target from runtime crashes.
 - `references/platforms.md` — macOS/WSL/Linux toolchain setup.
+- `references/setup-wsl2.md` — Windows + WSL2 step-by-step install, path
+  guidance, Fuzz Introspector options, and troubleshooting.
 - `references/oss-fuzz-gen-notes.md` — design background and transferable ideas.
