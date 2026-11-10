@@ -34,6 +34,7 @@ dtfuzz-skill/
     │   ├── reachability.md           # Fuzz Introspector 报告、可达闭包与打桩范围
     │   ├── external-sources.md       # 外挂库/SDK 源码询问、函数/宏/类型扫描
     │   ├── setup-wsl2.md             # Windows + WSL2 安装与排障
+    │   ├── reporting.md              # 强制报告契约与 JSON sidecar schema
     │   ├── coverage-loop.md          # 覆盖率缺口分类与优化策略
     │   ├── bug-finding.md            # fork 模式与 ASan 崩溃挖掘
     │   ├── platforms.md              # macOS / WSL / Linux 工具链
@@ -592,6 +593,18 @@ dtfuzz externals scan --workdir /repo/.dtfuzz/msg --json
 
 ---
 
+## 最终报告（强制）
+
+`dtfuzz report` 必须输出以下五块，缺一不可；某一项为空也要明确写"无"并说明原因：
+
+1. **被测入口与调用链 graph**：从入口可达的完整 Mermaid 调用图 + 边表，完整数据在 `callgraph.json`。
+2. **函数级覆盖**：最终语料覆盖到的每个函数的 libFuzzer count、行覆盖/总行数、百分比、未覆盖行；完整数据在 `function_coverage.json`。
+3. **打桩函数报告**：逐个列出打桩函数、签名、状态、打桩原因、行为（return/out/body）、证据、来源；未确认和禁止打桩的真实定义也列出；完整数据在 `stubs.json`。
+4. **问题列表**：严重性/类别/问题/证据/建议，覆盖构建、must-link、覆盖率、崩溃、外部源码、待审核约束等；完整数据在 `problems.json`。
+5. **分析报告与建议**：构建是否有效、覆盖率 vs 目标、崩溃数、打桩/待确认/禁止打桩统计、结论与下一步；完整数据在 `analysis_report.json`。
+
+细节见 `auto-dtfuzz/references/reporting.md`。注意：最后一次 `round` 后要重新跑 `coverage`，否则 `summary.json` 的逐函数字段可能不完整。
+
 ## 重要约束
 
 - **真实链接优先**：全仓扫描定义（允许跨模块），有真实实现就链接，不要 mock。
@@ -704,6 +717,6 @@ rm ~/.claude/skills/auto-dtfuzz
 
 ## 版本
 
-当前 CLI 版本：`0.5.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
+当前 CLI 版本：`0.6.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
 
 更详细的命令、字段和扩展点见 `auto-dtfuzz/references/`。

@@ -891,6 +891,7 @@ def analyze_repo(
         "external_symbols": external_symbols,
         "pending_mock_count": len(pending),
         "internal_calls": [_call_summary(item, repo_path) for item in internal_calls],
+        "external_calls": [_call_summary(item, repo_path) for item in external_calls],
         "system_calls": [_call_summary(item, repo_path) for item in system_calls],
         "unknown_calls": [_call_summary(item, repo_path) for item in unknown_calls],
         "entry_candidates": [

@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from .mocks import constraint_summary, summary as mocks_summary
+from .reporting import build_sections
 from .util import read_json, write_text
 
 
@@ -45,6 +46,10 @@ def generate_report(workspace, config: dict, analysis: dict, mocks: dict) -> str
         ),
         "",
     ]
+    mandatory_sections, _artifacts = build_sections(
+        workspace, config, analysis, mocks, summary, runs, build_info
+    )
+    lines.extend(mandatory_sections)
     if not summary:
         last_run = runs[-1] if runs else {}
         stats = last_run.get("stats", {}) or {}

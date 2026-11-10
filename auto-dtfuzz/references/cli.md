@@ -429,6 +429,20 @@ dtfuzz repro --workdir DIR --input INPUT --json
 dtfuzz clean --workdir DIR [--all|--build|--coverage|--corpus|--artifacts] --json
 ```
 
+`report` writes the mandatory five sections and sidecars:
+
+- `report.md` — `报告摘要`, `1. 被测入口与调用链`, `2. 函数级覆盖情况`,
+  `3. 打桩函数报告`, `4. 问题列表`, `5. 分析报告与建议`, plus detailed
+  appendices.
+- `callgraph.json` — entry-reachable call graph (nodes/edges/Mermaid).
+- `function_coverage.json` — per-function libFuzzer count and line coverage.
+- `stubs.json` — confirmed/pending/blocked stubs with reasons.
+- `problems.json` — severity/category/problem/evidence/action.
+- `analysis_report.json` — conclusions and recommendations.
+
+See `references/reporting.md`. Rerun `coverage` after the last `round` so the
+per-function fields are fresh.
+
 ## config.json schema (important fields)
 
 ```json

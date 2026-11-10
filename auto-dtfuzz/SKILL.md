@@ -33,6 +33,14 @@ libFuzzer runtime and a matching `llvm-cov` / `llvm-profdata`.
 
 - **Never claim coverage without reading `coverage/summary.json`** (or the
   `coverage` object from `round`). Report covered/total and percent.
+- **The final report has four mandatory deliverables.** `dtfuzz report` must
+  produce: (1) the full call-chain graph from the tested entry
+  (`callgraph.json` + Mermaid in `report.md`), (2) per-function coverage for
+  every function reached by the final corpus (`function_coverage.json`), (3) a
+  stub report naming each stubbed function and why (`stubs.json`), and (4) a
+  problem list plus analysis/conclusion section (`problems.json`,
+  `analysis_report.json`). Never submit or summarize a report missing any of
+  these; if a section is empty, say so explicitly.
 - **A real definition is never mockable.** Walk the transitive callee closure
   from the entry (AST call graph + function-pointer references + Fuzz
   Introspector `functionsReached`). For every reachable function, if a
@@ -610,20 +618,32 @@ fork children abort.
 "$DTFUZZ" report --workdir "$WORK" --json
 ```
 
-Present, in Chinese by default:
+Present, in Chinese by default. These five sections are **mandatory**; if one is
+empty, state that explicitly instead of omitting it:
 
-- Entry signature and input model.
-- Reachability source: Fuzz Introspector report path, entry match, reachable /
-  in-module / external counts, and the external stub scope. If the report is
-  missing, say the scope came from the AST fallback.
-- Line / function / branch coverage with covered/total and target files.
-- Uncovered functions/lines and their classification (seed / mock / unreachable).
-- Crashes with reproduction command and top frames.
-- Mock configuration summary (symbol, reachable/scope, return, out params, source).
-- Input constraints: all four classes, with `⚠️ 待审核` highlighted for
-  unconfirmed items. State that they are drafts and do not affect the build yet.
-- Workspace paths: `report.md`, corpus, artifacts, build log.
-- Concrete next actions.
+1. **被测入口与调用链** — entry signature, full Mermaid call-chain graph from
+   the entry, node/edge table, `callgraph.json`. The graph must be the entry's
+   reachable chain, not unrelated functions from linked real files.
+2. **函数级覆盖情况** — every function reached by the final corpus with
+   libFuzzer count, covered/total lines, percent, uncovered lines; separate
+   covered / partial / uncovered tables; `function_coverage.json`.
+3. **打桩函数报告** — each confirmed stub with signature, status, reason,
+   behavior (return/out/body), evidence, source; pending mocks and blocked
+   real definitions; `stubs.json`.
+4. **问题列表** — severity, category, problem, evidence, action; build,
+   must-link, coverage, crashes, external-source, constraints, warnings;
+   `problems.json`.
+5. **分析报告与建议** — conclusions and next actions, including whether the
+   build is valid, coverage vs target, crashes, stub/pending/blocked counts;
+   `analysis_report.json`.
+
+Supplementary details may follow: reachability source, target-file tables,
+uncovered-line classification, crash stacks/repro commands, mock configuration,
+input constraints (with `⚠️ 待审核`), external sources/macros/types, workspace
+paths, and reproduction commands.
+
+If coverage is below target and the loop stopped, say why (plateau, max rounds,
+unreachable lines, fixed mock behavior) rather than implying success.
 
 If coverage is below target and the loop stopped, say why (plateau, max rounds,
 unreachable lines, fixed mock behavior) rather than implying success.
@@ -635,6 +655,9 @@ unreachable lines, fixed mock behavior) rather than implying success.
   bodies, the four input-constraint classes, worked examples.
 - `references/reachability.md` — Fuzz Introspector report generation, field
   mapping, entry matching, stub scope, and troubleshooting.
+- `references/reporting.md` — mandatory final-report contract and the
+  `callgraph.json` / `function_coverage.json` / `stubs.json` /
+  `problems.json` / `analysis_report.json` schemas.
 - `references/external-sources.md` — user-provided library/SDK source
   directories, function/macro/type scanning, inquiry, and optional linking.
 - `references/coverage-loop.md` — gap classification, seed strategies, stopping

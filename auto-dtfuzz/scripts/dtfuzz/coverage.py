@@ -96,6 +96,19 @@ def _region_lines(function: dict) -> set[int]:
     return lines
 
 
+def _code_lines(function: dict) -> set[int]:
+    """All source lines described by code regions (not expansion/branch/gap)."""
+    lines: set[int] = set()
+    for region in function.get("regions", []) or []:
+        if not isinstance(region, list) or len(region) < 8:
+            continue
+        start_line, _, end_line, _, _, _, _, kind = region[:8]
+        if int(kind) != REGION_CODE:
+            continue
+        lines.update(range(int(start_line), int(end_line) + 1))
+    return lines
+
+
 def _segment_uncovered_lines(file_entry: dict) -> set[int]:
     lines: set[int] = set()
     for segment in file_entry.get("segments", []) or []:
@@ -173,13 +186,19 @@ def collect(workspace, config: dict, analysis: dict) -> dict:
             continue
         filename = matched[0] if matched else (filenames[0] if filenames else "")
         raw_name = function.get("name", "")
+        uncovered = _region_lines(function)
+        code_lines = _code_lines(function)
+        covered_lines = code_lines - uncovered
         record = {
             "name": demangled.get(raw_name, raw_name),
             "raw_name": raw_name,
             "file": rel_to(filename, repo) if repo else filename,
             "count": int(function.get("count", 0)),
             "regions": len(function.get("regions", []) or []),
-            "uncovered_lines": sorted(_region_lines(function)),
+            "total_lines": len(code_lines),
+            "covered_lines": len(covered_lines),
+            "percent": round(len(covered_lines) * 100.0 / len(code_lines), 2) if code_lines else 0.0,
+            "uncovered_lines": sorted(uncovered),
         }
         functions_out.append(record)
         if record["count"] == 0:
