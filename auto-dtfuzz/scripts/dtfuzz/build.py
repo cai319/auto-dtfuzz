@@ -6,6 +6,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from . import makefile as makefile_mod
 from .util import DtfuzzError, now_iso, read_json, rel_to, resolve, run, sha256_text, write_json, write_text
 
 CPP_EXTS = {".cc", ".cpp", ".cxx", ".c++", ".mm"}
@@ -53,7 +54,13 @@ def _std_flags(config: dict, path: str) -> list[str]:
     return ["-std=gnu11"]
 
 
-def _compile_flags(config: dict, toolchain: dict, source: str, extra_include_dirs: list[str] | None = None) -> list[str]:
+def _compile_flags(
+    config: dict,
+    toolchain: dict,
+    source: str,
+    extra_include_dirs: list[str] | None = None,
+    extra_flags: list[str] | None = None,
+) -> list[str]:
     sources = config.get("sources", {})
     include_dirs = []
     repo = config.get("repo", "")
@@ -73,6 +80,7 @@ def _compile_flags(config: dict, toolchain: dict, source: str, extra_include_dir
     for define in sources.get("defines", []) or []:
         flags.append("-D" + str(define))
     flags.extend([str(item) for item in sources.get("extra_cflags", []) or []])
+    flags.extend(extra_flags or [])
     return flags
 
 
@@ -128,6 +136,28 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
     workspace.ensure()
     repo = config.get("repo", "")
     toolchain = config.get("toolchain", {})
+    build_cfg = config.get("build", {}) or {}
+    make_intro = analysis.get("makefile")
+    make_host = None
+    if build_cfg.get("mode") == "make-host":
+        if not make_intro:
+            make_intro = makefile_mod.introspect(
+                repo,
+                build_cfg.get("makefile") or "Makefile",
+                build_cfg.get("make_target") or "",
+            )
+            analysis["makefile"] = make_intro
+        sources_cfg = config.setdefault("sources", {})
+        sources_cfg["include_dirs"] = list(dict.fromkeys(
+            [*(sources_cfg.get("include_dirs") or []), *(make_intro.get("include_dirs") or [])]
+        ))
+        sources_cfg["defines"] = list(dict.fromkeys(
+            [*(sources_cfg.get("defines") or []), *(make_intro.get("defines") or [])]
+        ))
+        if not sources_cfg.get("std") and make_intro.get("std"):
+            sources_cfg["std"] = make_intro["std"]
+        if build_cfg.get("run_make", True):
+            make_host = makefile_mod.run_host_make(workspace, config, analysis, make_intro)
     clang = toolchain.get("clang") or "clang"
     clangxx = str(Path(clang).with_name("clang++")) if Path(clang).with_name("clang++").is_file() else "clang++"
     harness_candidates = [
@@ -168,7 +198,10 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
         if Path(source).suffix.lower() in CPP_EXTS:
             has_cpp = True
         obj = obj_dir / (sha256_text(source)[:16] + ".o")
-        flags = _compile_flags(config, toolchain, source, [str(workspace.harness_dir), str(mocks_dir)])
+        extra_flags = (make_intro or {}).get("flags_by_source", {}).get(str(Path(source).resolve()), [])
+        flags = _compile_flags(
+            config, toolchain, source, [str(workspace.harness_dir), str(mocks_dir)], extra_flags
+        )
         result = _compile_one(compiler, source, str(obj), flags, repo or str(workspace.root))
         compile_results.append(result)
         commands.append(result["command"])
@@ -187,6 +220,9 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
         result = {
             "ok": False,
             "stage": "compile",
+            "build_mode": build_cfg.get("mode", "direct"),
+            "make_host": make_host,
+            "makefile": (make_intro or {}).get("makefile", ""),
             "binary": "",
             "log": str(build_log),
             "commands": commands,
@@ -248,6 +284,9 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
         result = {
             "ok": False,
             "stage": "link",
+            "build_mode": build_cfg.get("mode", "direct"),
+            "make_host": make_host,
+            "makefile": (make_intro or {}).get("makefile", ""),
             "binary": "",
             "log": str(build_log),
             "commands": commands,
@@ -276,6 +315,9 @@ def build(workspace, config: dict, analysis: dict, auto_stub: bool = False, jobs
     result = {
         "ok": True,
         "stage": "link",
+        "build_mode": build_cfg.get("mode", "direct"),
+        "make_host": make_host,
+        "makefile": (make_intro or {}).get("makefile", ""),
         "binary": str(binary),
         "log": str(build_log),
         "commands": commands,
@@ -327,9 +369,15 @@ def probe(workspace, config: dict, analysis: dict) -> dict:
     obj_dir.mkdir(parents=True, exist_ok=True)
     results = []
     objects: list[str] = []
+    make_intro = analysis.get("makefile") or {}
     for source in sources:
         obj = obj_dir / (sha256_text(source)[:16] + ".o")
-        flags = _compile_flags(config, toolchain, source, [str(workspace.harness_dir), str(workspace.mocks_dir(config))])
+        extra_flags = (make_intro.get("flags_by_source") or {}).get(str(Path(source).resolve()), [])
+        flags = _compile_flags(
+            config, toolchain, source,
+            [str(workspace.harness_dir), str(workspace.mocks_dir(config))],
+            extra_flags,
+        )
         result = _compile_one(clang if Path(source).suffix.lower() not in CPP_EXTS else str(Path(clang).with_name("clang++")), source, str(obj), flags, repo or str(workspace.root))
         results.append(result)
         if result["returncode"] == 0:

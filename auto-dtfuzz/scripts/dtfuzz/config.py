@@ -79,6 +79,13 @@ DEFAULT_CONFIG: dict = {
         "python": "python3",
     },
     "external_sources": [],
+    "build": {
+        "mode": "direct",
+        "makefile": "Makefile",
+        "make_target": "",
+        "make_jobs": 0,
+        "run_make": True,
+    },
     "harness": {
         "reset_code": "",
         "init_code": "",

@@ -375,6 +375,15 @@ def build_problem_list(
             build_info.get("log", "") or build_info.get("stage", ""),
             "读取 build/build.log；修复后重新 gen/build。",
         )
+    make_host = build_info.get("make_host") or {}
+    if make_host and not make_host.get("ok"):
+        add(
+            "medium",
+            "build",
+            "make-host 未产出 host 对象/库",
+            make_host.get("log", ""),
+            "检查 make-host.log、compiler shims、架构相关 TU；必要时排除或提供 host 替身。",
+        )
     for item in analysis.get("external_symbols", []) or []:
         if item.get("must_link"):
             add(
@@ -523,6 +532,8 @@ def build_analysis_report(
         recommendations.append("当前没有高优先级阻塞项；可扩大 fuzz 时长/轮次或增加接口级 campaign。")
     return {
         "build_ok": bool(build_info.get("ok")),
+        "build_mode": (config.get("build", {}) or {}).get("mode", "direct"),
+        "make_host_ok": (build_info.get("make_host") or {}).get("ok"),
         "coverage": {"line": line, "function": function, "branch": branch},
         "crashes": {"target": crashes, "non_target": non_target},
         "stubs": {key: len(value) for key, value in stubs.items()},

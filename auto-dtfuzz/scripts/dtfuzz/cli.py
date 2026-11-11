@@ -11,6 +11,7 @@ from pathlib import Path
 from . import coverage as coverage_mod
 from . import externals as externals_mod
 from . import introspect as introspect_mod
+from . import makefile as makefile_mod
 from . import optimize as optimize_mod
 from . import setup as setup_mod
 from .analyze import analyze_repo
@@ -187,9 +188,30 @@ def cmd_init(args) -> dict:
         existing_config = ws.load_config()
     ws.ensure()
     toolchain = toolchain_for_config(repo, resolve(args.source, repo) if args.source else None)
-    include_dirs = list(dict.fromkeys(list(args.include or []) + list(toolchain.get("include_dirs", []))))
-    defines = list(dict.fromkeys(list(args.define or []) + list(toolchain.get("defines", []))))
-    std = args.std or toolchain.get("std", "")
+    build_mode = getattr(args, "build_mode", None) or "direct"
+    make_intro = None
+    if build_mode == "make-host":
+        try:
+            make_intro = makefile_mod.introspect(
+                repo,
+                getattr(args, "makefile", None) or "Makefile",
+                getattr(args, "make_target", None) or "",
+            )
+        except DtfuzzError as exc:
+            raise DtfuzzError(
+                f"--build-mode make-host could not introspect the Makefile: {exc}"
+            ) from exc
+    include_dirs = list(dict.fromkeys(
+        list(args.include or [])
+        + list(toolchain.get("include_dirs", []))
+        + list((make_intro or {}).get("include_dirs", []))
+    ))
+    defines = list(dict.fromkeys(
+        list(args.define or [])
+        + list(toolchain.get("defines", []))
+        + list((make_intro or {}).get("defines", []))
+    ))
+    std = args.std or (make_intro or {}).get("std") or toolchain.get("std", "")
     external_temp: dict = {"external_sources": [], "sources": {}}
     for external_path in getattr(args, "external_source", None) or []:
         externals_mod.add_source(external_temp, external_path)
@@ -250,6 +272,8 @@ def cmd_init(args) -> dict:
         introspect_mod.attach(analysis, reachability, repo)
         analysis.setdefault("warnings", []).extend(reachability.get("warnings", []))
         introspect_mod.write_reachability(ws, reachability)
+    if make_intro:
+        analysis["makefile"] = make_intro
     config = deep_merge(DEFAULT_CONFIG, existing_config or {})
     config.update(
         {
@@ -259,6 +283,13 @@ def cmd_init(args) -> dict:
             "build_system": args.build_system or toolchain.get("build_system", "unknown"),
         }
     )
+    config["build"] = {
+        **(config.get("build") or {}),
+        "mode": build_mode,
+        "makefile": getattr(args, "makefile", None) or "Makefile",
+        "make_target": getattr(args, "make_target", None) or "",
+        "make_jobs": int(getattr(args, "make_jobs", 0) or 0),
+    }
     if external_temp["external_sources"]:
         config.setdefault("external_sources", [])
         known_paths = {item.get("path") for item in config["external_sources"]}
@@ -461,6 +492,23 @@ def cmd_init(args) -> dict:
 def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, extra_warnings: list[str] | None = None) -> tuple[dict, dict, dict]:
     toolchain = config.get("toolchain", {})
     entry = config.get("entry", {})
+    build_cfg = config.get("build", {}) or {}
+    make_intro = None
+    if build_cfg.get("mode") == "make-host":
+        make_intro = makefile_mod.introspect(
+            config["repo"],
+            build_cfg.get("makefile") or "Makefile",
+            build_cfg.get("make_target") or "",
+        )
+        sources_cfg = config.setdefault("sources", {})
+        sources_cfg["include_dirs"] = list(dict.fromkeys(
+            [*(sources_cfg.get("include_dirs") or []), *(make_intro.get("include_dirs") or [])]
+        ))
+        sources_cfg["defines"] = list(dict.fromkeys(
+            [*(sources_cfg.get("defines") or []), *(make_intro.get("defines") or [])]
+        ))
+        if not sources_cfg.get("std") and make_intro.get("std"):
+            sources_cfg["std"] = make_intro["std"]
     analysis = analyze_repo(
         repo=config["repo"],
         entry_name=entry.get("name", ""),
@@ -472,6 +520,8 @@ def _reanalyze(ws: Workspace, config: dict, reachability: dict | None = None, ex
         exclude_dirs=set(config.get("sources", {}).get("exclude_dirs", []) or []),
         reachability=reachability,
     )
+    if make_intro:
+        analysis["makefile"] = make_intro
     if extra_warnings:
         analysis.setdefault("warnings", []).extend(extra_warnings)
     if reachability:
@@ -1350,6 +1400,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--std")
     p.add_argument("--language", choices=["c", "cpp"])
     p.add_argument("--build-system")
+    p.add_argument(
+        "--build-mode",
+        choices=["direct", "make-host"],
+        default="direct",
+        help="direct: clang over source files; make-host: reuse Makefile flags with host clang shims",
+    )
+    p.add_argument("--makefile", default="Makefile")
+    p.add_argument("--make-target", default="")
+    p.add_argument("--make-jobs", type=int, default=0)
     p.add_argument("--workdir")
     p.add_argument("--force", action="store_true")
     p.add_argument("--no-real-scan", action="store_true", help="analyze only the entry; use for prebuilt libraries")

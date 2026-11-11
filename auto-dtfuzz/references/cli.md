@@ -85,9 +85,16 @@ Windows is supported only through WSL2. See `references/setup-wsl2.md`.
 dtfuzz init --repo PATH --entry NAME [--source FILE] [--workdir DIR] \
   [--include DIR]... [--define NAME=VALUE]... [--std STD] \
   [--language c|cpp] [--build-system make|cmake|...] [--force] \
+  [--build-mode direct|make-host] [--makefile Makefile] \
+  [--make-target TARGET] [--make-jobs N] \
   [--no-real-scan] [--introspector REPORT] [--no-introspector] \
   [--external-source DIR]... --json
 ```
+
+`--build-mode make-host` uses the project Makefile's sources/include dirs/
+defines, replaces cross compilers with host clang shims, strips target-only
+flags, and validates with `make -k`. It does not copy function bodies. See
+`references/build-modes.md`.
 
 `--external-source DIR` registers a user-provided library/SDK source directory
 before analysis, adds its root/includes to the clang include path, and scans it
@@ -513,6 +520,13 @@ per-function fields are fresh.
     "fi_src": "",
     "python": "python3"
   },
+  "build": {
+    "mode": "direct",
+    "makefile": "Makefile",
+    "make_target": "",
+    "make_jobs": 0,
+    "run_make": true
+  },
   "external_sources": [
     {
       "name": "secure-c",
@@ -552,6 +566,11 @@ never fabricates mocks unless the caller passes `--auto-stub`.
 auto-discover. `auto` is the discovery switch used by `init`/`analyze`.
 `fi_clang`/`fi_src`/`python` are used by `introspect --run-lto` /
 `--run-light`. See `references/reachability.md`.
+
+`build.mode` is `direct` (compile discovered sources with clang) or `make-host`
+(reuse Makefile sources/include/defines with host clang compiler shims). In
+`make-host`, `makefile`/`make_target`/`make_jobs` select the Makefile; `run_make`
+controls the `make -k` portability check. See `references/build-modes.md`.
 
 `external_sources` is the user-provided mounted library/SDK registry. Scanning
 is read-only, but a matched definition is treated as real: `must_link` blocks

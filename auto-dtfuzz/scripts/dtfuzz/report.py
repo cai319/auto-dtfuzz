@@ -38,6 +38,21 @@ def generate_report(workspace, config: dict, analysis: dict, mocks: dict) -> str
         f"- 入口：`{entry.get('qualified_name') or entry.get('name', '')}`（`{entry.get('file', '')}`）",
         f"- 输入模型：`{entry.get('input_model', '')}`",
         f"- 构建：{'成功' if build_info.get('ok') else '失败'}（`{build_info.get('binary', '')}`）",
+        f"- 构建模式：`{(config.get('build', {}) or {}).get('mode', 'direct')}`"
+        + (
+            f"（Makefile `{build_info.get('makefile')}`，target `{(build_info.get('make_host') or {}).get('target', '')}`）"
+            if build_info.get("makefile")
+            else ""
+        ),
+        *(
+            [
+                f"- make-host：{'成功' if (build_info.get('make_host') or {}).get('ok') else '失败/未运行'}，"
+                f"objects={(build_info.get('make_host') or {}).get('objects', [])[:3]}，"
+                f"shims={list(((build_info.get('make_host') or {}).get('shims') or {}).get('created', {}))}"
+            ]
+            if build_info.get("make_host")
+            else []
+        ),
         f"- 工具链：`{config.get('toolchain', {}).get('clang', '')}`",
         f"- 真实链接的跨模块源文件：{len(analysis.get('real_files', []) or [])} 个",
         f"- Mock 配置：`{workspace.mocks_config_path(config)}`",

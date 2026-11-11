@@ -35,6 +35,7 @@ dtfuzz-skill/
     │   ├── external-sources.md       # 外挂库/SDK 源码询问、函数/宏/类型扫描
     │   ├── setup-wsl2.md             # Windows + WSL2 安装与排障
     │   ├── reporting.md              # 强制报告契约与 JSON sidecar schema
+    │   ├── build-modes.md            # direct / make-host、交叉工具链 shim
     │   ├── coverage-loop.md          # 覆盖率缺口分类与优化策略
     │   ├── bug-finding.md            # fork 模式与 ASan 崩溃挖掘
     │   ├── platforms.md              # macOS / WSL / Linux 工具链
@@ -509,6 +510,22 @@ dtfuzz externals scan --workdir /repo/.dtfuzz/msg --json
 
 扫描本身只读。但**外挂目录中的可达函数定义默认视为真实定义**：标记 `must_link`，禁止生成/保留 mock；`build` 会提示你链接它。只有你确认“这是生产实现”时才加 `--link`，把源码加入 `sources.real` 并重新 `probe`，已解析符号会自动转为 `linked_real`。仅当该目录只是**非生产的参考代码**时，才使用 `--reference-only` 放开 mock。详见 `auto-dtfuzz/references/external-sources.md`。
 
+## 交叉编译项目（`--build-mode make-host`）
+
+如果项目 Makefile 使用 ARM/MIPS 等交叉工具链，libFuzzer 仍然应该跑在 host 上，而不是设备二进制。`make-host` 会复用 Makefile 的源文件/include/define，把交叉编译器替换成 host clang shim，并过滤 `-march`/`-mfpu`/`-mfloat-abi`/`--sysroot` 等目标 flags：
+
+```sh
+dtfuzz init --repo /repo --entry msg_dispatch --source src/msg.c \
+  --workdir /repo/.dtfuzz/msg \
+  --build-mode make-host --makefile Makefile [--make-target all] --json
+dtfuzz gen   --workdir /repo/.dtfuzz/msg --json
+dtfuzz build --workdir /repo/.dtfuzz/msg --json
+```
+
+`init` 执行 `make -Bn` 提取源文件、include、define、std；`build` 在 workspace 的 `shims/` 下生成编译器 shim，先跑 `make -k` 做 host 可移植性验证，再用同一套 flags 编译 harness。`build.json` 记录 `make_host.objects/libraries/log/shims`。
+
+限制：绝对路径交叉编译器、`$(shell $(CC) ...)`、架构相关 asm/MMIO、firmware link 脚本需要人工处理；详见 `auto-dtfuzz/references/build-modes.md`。
+
 ## 覆盖率与产物
 
 工作区结构：
@@ -717,6 +734,6 @@ rm ~/.claude/skills/auto-dtfuzz
 
 ## 版本
 
-当前 CLI 版本：`0.6.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
+当前 CLI 版本：`0.7.0`（见 `auto-dtfuzz/scripts/dtfuzz/__init__.py` 和 `scripts/pyproject.toml`）。
 
 更详细的命令、字段和扩展点见 `auto-dtfuzz/references/`。

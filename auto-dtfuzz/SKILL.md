@@ -240,6 +240,27 @@ exists, say so and fall back to the AST graph — do not claim the scope is
 deterministic. See `references/reachability.md` for field mapping and
 troubleshooting.
 
+### Cross-compiled Makefile projects (`--build-mode make-host`)
+
+If the project Makefile uses a cross toolchain (ARM/MIPS/etc.), do not use that
+compiler for libFuzzer and do not copy function bodies into the harness.
+libFuzzer targets are host binaries. Use:
+
+```sh
+"$DTFUZZ" init --repo "$REPO" --entry "$ENTRY" --source "$SRC" \
+  --workdir "$REPO/.dtfuzz/$MODULE" \
+  --build-mode make-host --makefile Makefile [--make-target all] --json
+```
+
+`make-host` introspects `make -Bn`, extracts sources/include dirs/defines/std,
+strips target-only flags (`-march`, `-mfpu`, `-mfloat-abi`, `--sysroot`, ...),
+creates host clang compiler shims under the workspace, runs `make -k` with those
+shims to validate host portability, and compiles the harness with the Makefile's
+flags. `build.json` records `build_mode`, `makefile`, and `make_host` objects/
+shims/log. If the Makefile hardcodes an absolute cross-compiler path or executes
+`$(shell $(CC) ...)`, handle it manually or provide a host target. Full details:
+`references/build-modes.md`.
+
 After changing `sources.real`, `sources.exclude`, or `sources.exclude_dirs`,
 re-run the link probe:
 
@@ -664,6 +685,8 @@ unreachable lines, fixed mock behavior) rather than implying success.
   rules, common failure modes.
 - `references/bug-finding.md` — fork-mode discovery, ASan bug classes, the
   bug-zoo validation, and how to separate target from runtime crashes.
+- `references/build-modes.md` — direct vs `make-host`, cross-toolchain shims,
+  target-flag stripping, portability blockers, and validation.
 - `references/platforms.md` — macOS/WSL/Linux toolchain setup.
 - `references/setup-wsl2.md` — Windows + WSL2 step-by-step install, path
   guidance, Fuzz Introspector options, and troubleshooting.
